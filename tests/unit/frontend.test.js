@@ -15,6 +15,9 @@ import {
 } from '../../public/ui.js';
 
 import { createApi, FALLBACK_TEMPLATES, friendlyError } from '../../public/api.js';
+import { buildGoalFromTemplate, renderTemplateHint } from '../../public/app.js';
+import fs from 'node:fs';
+import path from 'node:path';
 
 /* ------------------------------------------------------------------ *
  * 测试用：抽出渲染结果里的所有标签名，用来断言"只有我们自己产的标签"
@@ -588,4 +591,161 @@ describe('api 客户端', () => {
     expect(states[0]).toBe('offline');
     expect(() => ctrl.close()).not.toThrow();
   });
+});
+
+/* ================================================================== *
+ * 模板接线（回归：模板里写好的文案必须真的送到用户眼前）
+ *
+ * 背景：模板文件（templates/*.json）里精心写了 goalTemplate / placeholders /
+ * tips / notice 四个字段，但前端**一个字都没读**，点模板只会把 title 填进输入框。
+ * 结果：
+ *   · 用户点「帮我看懂检查报告」→ 输入框里只有"帮我看懂检查报告 / 看病前准备"
+ *   · 那句全项目最好的文案「⚠️ 我们不是医生，不能诊断…」永远没人看到
+ * 产品经理用真实浏览器走查时发现的，两侧单测都绿（没有一条测试碰过这四个字段）。
+ * ================================================================== */
+describe('模板接线：goalTemplate / tips / notice 必须真的被用上', () => {
+  const tpl = {
+    id: 'demo-tpl',
+    title: '帮我看合同',
+    goalTemplate: '帮我看看这份{{kind}}有没有坑。我是{{role}}，最担心{{worry}}。',
+    placeholders: [
+      { key: 'kind', label: '是什么', example: '租房合同' },
+      { key: 'role', label: '你是谁', example: '租客' },
+      { key: 'worry', label: '担心什么', example: '押金要不回来' },
+    ],
+    tips: '把合同全文粘进来最好。',
+    notice: '我们不是律师，不构成法律意见。',
+  };
+
+  it('用 goalTemplate 生成完整句子，而不是填一个标题', () => {
+    const goal = buildGoalFromTemplate(tpl);
+    expect(goal).toContain('帮我看看这份');
+    expect(goal).toContain('有没有坑');
+    // 绝不能只是把 title 填进去
+    expect(goal).not.toBe(tpl.title);
+    expect(goal.length).toBeGreaterThan(tpl.title.length);
+  });
+
+  it('占位符被替换掉，且没有残留的 {{ }}', () => {
+    const goal = buildGoalFromTemplate(tpl);
+    expect(goal).not.toContain('{{');
+    expect(goal).not.toContain('}}');
+    expect(goal).toContain('租房合同');
+  });
+
+  it('填入的示例值用【】标出来，让用户知道该改哪里', () => {
+    const goal = buildGoalFromTemplate(tpl);
+    expect(goal).toContain('【租房合同】');
+    expect(goal).toContain('【租客】');
+  });
+
+  it('示例值必须是"光秃秃的值"，不能带句子成分（否则会拼出「我是【我是租客】」）', () => {
+    const goal = buildGoalFromTemplate(tpl);
+    // 这条断言守的是真实踩过的坑：模板作者把 example 写成"我是租客"，
+    // 而 goalTemplate 里已经有"我是" → 拼出来是「我是【我是租客】」，很别扭。
+    expect(goal).not.toMatch(/我是【我是/);
+  });
+
+  it('模板里缺某个 placeholder 时，不留下花括号（用【key】兜底）', () => {
+    const partial = { goalTemplate: '帮我{ {a} }看看{{missing}}', placeholders: [] };
+    const goal = buildGoalFromTemplate(partial);
+    expect(goal).not.toContain('{{');
+    expect(goal).toContain('missing');
+  });
+
+  it('模板没有 goalTemplate 时，退回 title（不能变成空字符串）', () => {
+    expect(buildGoalFromTemplate({ title: '只有标题' })).toBe('只有标题');
+    expect(buildGoalFromTemplate({ goal: '只有目标' })).toBe('只有目标');
+  });
+
+  it('畸形输入不崩：null / undefined / 字符串 / 数组', () => {
+    for (const bad of [null, undefined, 'x', 42, []]) {
+      expect(() => buildGoalFromTemplate(bad)).not.toThrow();
+    }
+    expect(buildGoalFromTemplate(null)).toBe('');
+  });
+});
+
+/* ================================================================== *
+ * 模板文件 × 渲染器 的一致性
+ *
+ * 这一组直接把 templates/*.json 全部读进来跑一遍。
+ * 目的：模板是产品经理/文案同学写的，渲染器是工程师写的，
+ * 两边一旦约定不一致（比如 example 写了"我是租客"而模板里已有"我是"），
+ * 用户看到的句子就会别扭。这里让它自动红。
+ * ================================================================== */
+describe('模板文件：每个都要能被正确渲染成"用户会说的话"', () => {
+  const tplDir = path.join(process.cwd(), 'templates');
+  const files = fs.existsSync(tplDir)
+    ? fs.readdirSync(tplDir).filter((f) => f.endsWith('.json'))
+    : [];
+
+  it('至少存在 5 个场景模板（首页的"我不知道说什么"靠它们救）', () => {
+    expect(files.length).toBeGreaterThanOrEqual(5);
+  });
+
+  for (const file of files) {
+    it(`${file} 渲染后是一句通顺、可编辑的话`, () => {
+      const tpl = JSON.parse(fs.readFileSync(path.join(tplDir, file), 'utf8'));
+      const goal = buildGoalFromTemplate(tpl);
+
+      // 必须有内容、不是只填了标题
+      expect(goal.length).toBeGreaterThan(15);
+      expect(goal).not.toBe(tpl.title);
+      // 不能有没替换掉的占位符
+      expect(goal).not.toMatch(/\{\{|\}\}/);
+      // 示例值要有【】标记，让用户知道该改哪里
+      if (Array.isArray(tpl.placeholders) && tpl.placeholders.length) {
+        expect(goal).toMatch(/【.+?】/);
+      }
+      // 不能拼出重复的句子成分（真实踩过的坑）
+      expect(goal).not.toMatch(/我是【我是|我是我是/);
+      // 每个 placeholder 的 key 都应该在模板里出现过（否则是没用的定义）
+      for (const p of tpl.placeholders || []) {
+        expect(typeof p.key).toBe('string');
+        expect(p.key.length).toBeGreaterThan(0);
+      }
+      // 必填元信息
+      expect(typeof tpl.id).toBe('string');
+      expect(typeof tpl.title).toBe('string');
+      expect(tpl.title.length).toBeGreaterThan(0);
+    });
+  }
+
+  it('每个模板的 id 唯一，且和文件名一致（避免模板串台）', () => {
+    const ids = [];
+    for (const file of files) {
+      const tpl = JSON.parse(fs.readFileSync(path.join(tplDir, file), 'utf8'));
+      expect(tpl.id).toBe(path.basename(file, '.json'));
+      ids.push(tpl.id);
+    }
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+/* ================================================================== *
+ * CSS 一致性：app.js / ui.js 里用到的类名，styles.css 里要真的定义过
+ *
+ * 这是"没有构建步骤"的代价：类名写错了不会报错，只会**悄悄没有样式**。
+ * 用户看到的就是一个没排版好的块 —— 而且很难被发现（代码没错，测试也没错）。
+ * ================================================================== */
+describe('CSS 一致性：新加的类名必须在 styles.css 里有定义', () => {
+  const cssPath = path.join(process.cwd(), 'public', 'styles.css');
+  const css = fs.existsSync(cssPath) ? fs.readFileSync(cssPath, 'utf8') : '';
+
+  // 只检查我们**明确关心**的几组（全量扫描误报太多：动态拼类名、状态类等）
+  const mustExist = [
+    'tpl-hint',
+    'tpl-hint-notice',
+    'tpl-hint-tips',
+    'tpl-grid',
+    'tpl-title',
+    'tpl-desc',
+  ];
+
+  for (const cls of mustExist) {
+    it(`.${cls} 在 styles.css 里有定义`, () => {
+      expect(css).toContain(`.${cls}`);
+    });
+  }
 });

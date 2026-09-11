@@ -5,9 +5,21 @@
   "category": "办事避坑",
   "description": "租房、装修、兼职、报班……任何要签字的纸，先让它过一遍。",
   "placeholders": [
-    { "key": "contractType", "label": "是什么合同", "example": "租房合同" },
-    { "key": "myRole", "label": "你是哪一方", "example": "我是租客" },
-    { "key": "worry", "label": "你最担心什么", "example": "怕押金要不回来" }
+    {
+      "key": "contractType",
+      "label": "是什么合同",
+      "example": "租房合同"
+    },
+    {
+      "key": "myRole",
+      "label": "你是哪一方",
+      "example": "租客"
+    },
+    {
+      "key": "worry",
+      "label": "你最担心什么",
+      "example": "押金要不回来"
+    }
   ],
   "goalTemplate": "帮我看看这份{{contractType}}有没有坑。我是{{myRole}}，最担心的是{{worry}}。合同内容：\n\n（把合同内容粘贴到这里）",
   "tips": "把合同全文粘贴进来最好。如果太长，至少把「费用」「违约」「退租」这三部分粘进来。",

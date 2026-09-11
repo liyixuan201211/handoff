@@ -279,6 +279,62 @@ function newTaskForm(opts) {
   return { form, ui, textarea: ta };
 }
 
+/**
+ * 用模板里的 goalTemplate 生成一段"用户会说的话"。
+ *
+ * 为什么不是直接用 title：模板文件里的 `goalTemplate` 是**按真实口吻写好的整句**，
+ * 而 title 只是一个短标签（「帮我看合同有没有坑」）。
+ * 用户点模板是想"有个开头可以改"，填一个标题过去等于什么都没帮他。
+ *
+ * 填进去的示例值用【】包起来，让人一眼知道**这里要换成自己的内容** ——
+ * 否则用户会直接把示例当问题发出去（"我是租客"这种话会被当成真话）。
+ * @param {object} tpl 模板对象
+ * @returns {string} 预填到输入框里的文字
+ */
+export function buildGoalFromTemplate(tpl) {
+  if (!tpl || typeof tpl !== 'object') return '';
+  const tplText = typeof tpl.goalTemplate === 'string' ? tpl.goalTemplate.trim() : '';
+  if (!tplText) return String(tpl.goal || tpl.title || '').trim();
+
+  // 用【】把填入的示例值标出来，让用户一眼看到"这几处要换成我自己的"。
+  //
+  // 注意：示例值本身要写成"光秃秃的值"（`租客`），不能带句子成分
+  // （`我是租客`），否则会拼出「我是【我是租客】」这种别扭句子。
+  // 模板文件里的 example 已经按这个约定校准过 —— 加新模板时请遵守。
+  const values = {};
+  const placeholders = Array.isArray(tpl.placeholders) ? tpl.placeholders : [];
+  for (const p of placeholders) {
+    if (!p || typeof p !== 'object') continue;
+    const key = String(p.key || '').trim();
+    if (!key) continue;
+    const sample = String(p.example || p.label || '').trim();
+    values[key] = sample ? `【${sample}】` : '【】';
+  }
+
+  // 简单替换 {{key}}；缺失的键留成【key】而不是原样留着花括号
+  return tplText.replace(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g, (whole, key) =>
+    key in values ? values[key] : `【${key}】`,
+  );
+}
+
+/**
+ * 渲染模板的提示块（tips + notice）。
+ * 这两段话是模板作者写给用户的，包含"该怎么写才有效"和"这个场景的边界"。
+ */
+export function renderTemplateHint(box, tpl) {
+  if (!box) return;
+  clear(box);
+  const tips = typeof tpl?.tips === 'string' ? tpl.tips.trim() : '';
+  const notice = typeof tpl?.notice === 'string' ? tpl.notice.trim() : '';
+  if (!tips && !notice) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  if (notice) box.appendChild(text('p', 'tpl-hint-notice', notice));
+  if (tips) box.appendChild(text('p', 'tpl-hint-tips', tips));
+}
+
 function renderHome(main, state) {
   const page = el('div', { class: 'page page-home' });
 
@@ -308,16 +364,24 @@ function renderHome(main, state) {
   if (state.templatesStatus === 'loading') {
     tplSection.appendChild(skeleton('templates'));
   } else {
+    // 模板选中后，把「这份场景该怎么开口」提示显示在输入框下面。
+    // 模板文件里写好的 tips / notice 是这个产品最有价值的文案之一
+    // （例如体检报告那条的「我们不是医生，不能诊断」），
+    // 以前前端一个字都没读 —— 用户永远看不到。
+    const tplHint = el('div', { class: 'tpl-hint', hidden: true, role: 'note' });
+
     const grid = el('div', { class: 'tpl-grid' });
     (state.templates || []).forEach((tpl) => {
       grid.appendChild(templateCard(tpl, (picked) => {
-        textarea.value = picked.goal || picked.title || '';
+        textarea.value = buildGoalFromTemplate(picked);
         textarea.dispatchEvent(new Event('input'));
+        renderTemplateHint(tplHint, picked);
         textarea.focus();
-        toast('已填好，可以直接改或者点开始');
+        toast('已经按这个场景起好了头，把里面的内容改成你自己的就能发');
       }));
     });
     tplSection.appendChild(grid);
+    tplSection.appendChild(tplHint);
     if (state.templatesFallback) {
       tplSection.appendChild(el('p', { class: 'note' }, '没能从服务端拿到场景列表，先用内置的这几个。不影响使用。'));
     }

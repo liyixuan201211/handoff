@@ -131,6 +131,29 @@ button { font: inherit; color: inherit; }
 .small { font-size: .85rem; }
 .note { color: var(--text-2); font-size: .9rem; }
 
+/* 模板提示块：把 templates/*.json 里写好的 tips / notice 显示给用户。
+   其中 notice 常常是"这个场景的边界"（例如体检那条的"我们不是医生"），
+   所以给它一点警示色，让用户在点开始之前就看见。 */
+.tpl-hint {
+  margin-top: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2, var(--surface));
+  display: grid;
+  gap: var(--sp-2);
+}
+.tpl-hint-notice {
+  margin: 0;
+  color: var(--warn);
+  background: var(--warn-bg);
+  border-radius: var(--r-sm);
+  padding: var(--sp-2) var(--sp-3);
+  font-size: .9rem;
+  line-height: 1.6;
+}
+.tpl-hint-tips { margin: 0; color: var(--text-2); font-size: .9rem; line-height: 1.7; }
+
 .sr-only {
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
