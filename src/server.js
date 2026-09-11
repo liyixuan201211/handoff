@@ -330,7 +330,10 @@ function installProcessGuards() {
 export async function markInterruptedJobs() {
   let count = 0;
   try {
-    const jobs = await store.listJobs(200);
+    // ⚠️ 必须扫**磁盘全量**，不能用 listJobs（它只看内存缓存，上限 200 个）。
+    // 用 listJobs 的话，任务数超过 200 时更早的中断任务永远卡在"运行中" ——
+    // 用户每次打开都看到进度条不动，重启多少次都修不好（对抗性测试 S9-8）。
+    const jobs = await store.listAllJobsOnDisk();
     for (const job of jobs) {
       if (job.status !== 'running' && job.status !== 'queued') continue;
       const fresh = await store.updateJob(job.id, (j) => {

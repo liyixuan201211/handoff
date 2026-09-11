@@ -427,6 +427,43 @@ export async function getJob(id) {
   return job;
 }
 
+/**
+ * 磁盘上的**所有**任务（不受内存缓存上限约束）。
+ *
+ * 为什么需要它：`listJobs()` 只返回内存缓存里的 job，而缓存上限是 200 个。
+ * 于是「启动时把跑了一半的任务标记为中断」这种**必须扫全量**的维护操作，
+ * 一旦任务数超过 200，第 201 个及更早的中断任务就**永远卡在"运行中"** ——
+ * 用户每次打开都看到一个永远不会往前走的进度条，重启多少次都修不好
+ * （对抗性测试 S9-8 实测）。
+ *
+ * 注意：它会读盘，比 listJobs 慢，所以只给启动/维护路径用，不要放进请求热路径。
+ * @param {number} [limit] 安全上限，防止目录被塞了几万文件时启动卡死
+ */
+export async function listAllJobsOnDisk(limit = 5000) {
+  await ready();
+  const dir = getJobsDir();
+  let names = [];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return [...cache.values()];
+  }
+  const jobs = [];
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    if (jobs.length >= limit) break;
+    const id = name.slice(0, -'.json'.length);
+    if (!isValidJobId(id)) continue;
+    const job = await readFileSafe(jobFilePath(id));
+    if (job) jobs.push(job);
+  }
+  // 保险：把缓存里可能有、但目录里已经不在的也算进来（避免漏）
+  for (const job of cache.values()) {
+    if (!jobs.some((j) => j.id === job.id)) jobs.push(job);
+  }
+  return jobs;
+}
+
 /** 最新在前（updatedAt 降序），最多 limit 条，默认 50。 */
 export async function listJobs(limit = 50) {
   await ready();

@@ -59,8 +59,17 @@ class JobEvents {
     return () => this.#emitter.off(jobId, listener);
   }
 
-  /** job 被删除时清理 */
+  /**
+   * job 被删除时清理。
+   *
+   * ⚠️ 清理前必须先**通知**订阅者。原因（对抗性测试 S9-11）：
+   * 浏览器上的 SSE 连接是独立于 HTTP 请求存在的。任务被删了，
+   * 但那条连接和它的心跳定时器还活着 —— 用户看到界面上写着"已连接，进展会实时更新"，
+   * 实际上永远收不到任何业务事件，socket 也一直占着。
+   * 所以先发一条 `closed` 事件让 SSE 处理函数**主动关掉连接**，再清空监听器。
+   */
   drop(jobId) {
+    this.#emitter.emit(jobId, { type: 'closed', jobId, at: Date.now() });
     this.#logs.delete(jobId);
     this.#emitter.removeAllListeners(jobId);
   }

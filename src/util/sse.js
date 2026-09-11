@@ -87,6 +87,25 @@ export function sseHandler({ jobId, req, res, sinceSeq = 0 } = {}) {
 
   const send = (event) => {
     if (closed || !event || typeof event !== 'object') return;
+
+    // 任务被删了 → 主动关掉这条连接。
+    // 不处理的话，用户界面上写着"已连接，进展会实时更新"，
+    // 但那个任务已经不存在了，这条连接会一直挂着直到他关掉标签页（对抗性测试 S9-11）。
+    if (event.type === 'closed') {
+      try {
+        write('event: closed\ndata: {"type":"closed"}\n\n');
+      } catch {
+        /* 对端可能已经走了 */
+      }
+      cleanup();
+      try {
+        res.end?.();
+      } catch {
+        /* 同上是尽力而为 */
+      }
+      return;
+    }
+
     if (Number.isFinite(event.seq)) {
       // 已经发过的一律不重发（补发区间与实时推送在 subscribe 之后可能重叠）。
       // 只比较 lastSent 而不是维护一个 Set：SSE 连接可能挂几个小时，

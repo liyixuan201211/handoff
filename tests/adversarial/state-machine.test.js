@@ -393,7 +393,7 @@ describe('攻击：进程被强杀后重启（不做真实子进程，直接验�
   }, 30_000);
 
   // 【缺陷 S9-8】恢复逻辑只扫内存里的最近 200 个任务，更早的中断任务永远卡在 running
-  it.fails('【缺陷 S9-8】磁盘上第 201 个及更早的中断任务也必须被恢复', async () => {
+  it('回归（缺陷 S9-8 已修复）：磁盘上第 201 个及更早的中断任务也必须被恢复', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'handoff-adv-interrupted-'));
     const prevDir = process.env.HANDOFF_DATA_DIR;
     process.env.HANDOFF_DATA_DIR = dir;

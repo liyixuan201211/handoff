@@ -232,7 +232,7 @@ describe('攻击：SSE 断线重连的补发', () => {
 
   // 【缺陷 S9-11】任务被删除后，连接和心跳定时器都还活着：
   // 用户看到"已连接，进展会实时更新"，实际上永远不会再收到任何业务事件。
-  it.fails('【缺陷 S9-11】任务被删除时，属于它的 SSE 连接必须被关掉', async () => {
+  it('回归（缺陷 S9-11 已修复）：任务被删除时，属于它的 SSE 连接必须被关掉', async () => {
     const id = newJobId();
     events.drop(id);
     events.publish(id, { type: 'job', job: { id } });
@@ -244,15 +244,21 @@ describe('攻击：SSE 断线重连的补发', () => {
     res.end = (...args) => { closedByServer = true; return origEnd ? origEnd.apply(res, args) : res; };
     const cleanup = sseHandler({ jobId: id, req, res });
 
-    // 服务端没有把连接暴露出来，这里用"删完之后心跳还照发"来判定它没被关掉
     events.drop(id);
     await new Promise((r) => setTimeout(r, 50));
-    const framesAfterDrop = res.chunks.length;
-    res.write(': ping\n\n'); // 模拟 15 秒后的心跳（定时器还在）
-    await new Promise((r) => setTimeout(r, 50));
 
-    expect({ closedByServer, heartbeatsStillAccepted: res.chunks.length > framesAfterDrop })
-      .toEqual({ closedByServer: true, heartbeatsStillAccepted: false });
+    // 1) 服务端主动关掉了连接
+    expect(closedByServer).toBe(true);
+
+    // 2) 关掉之后**不许再有任何写入**。
+    // 注意：这里不能再手工调 `res.write` 来"模拟心跳" —— 那是我们在测试里
+    // 绕过内部定时器直接写，无论实现对不对都会让 chunks 变长，测不出东西。
+    // 真正要验的是"连接已关闭"这个状态本身：send/写入必须被 short-circuit。
+    const chunksAfterDrop = res.chunks.length;
+    events.publish(id, { type: 'log', text: '删完之后的事件不该再被发出去' });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(res.chunks.length).toBe(chunksAfterDrop);
+
     cleanup();
   });
 
