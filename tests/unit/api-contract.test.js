@@ -113,11 +113,18 @@ describe('接线：前端 api.js ↔ 后端 HTTP（这是唯一能发现"解包"
 
   it('sendMessage 发 { message } 能被接受（缺陷 #5 回归）', async () => {
     const created = await api.createJob({ goal: '接线测试：中途补充要求', demo: true });
-    // 等它稳定（demo 流水线很快）
+    // 等它**完全稳定**（不只是 status 变了，还要确保引擎已经释放了任务占位）。
+    // 之前只等 status !== 'running'，偶发撞上"流水线刚结束但占位还没释放"→ 409。
     let job = created;
-    for (let i = 0; i < 120 && job.status === 'running'; i += 1) {
+    for (let i = 0; i < 200; i += 1) {
       await new Promise((r) => setTimeout(r, 100));
       job = await api.getJob(created.id);
+      if (job.status !== 'running' && job.status !== 'queued') {
+        // 再给一拍，让引擎把 running 表里的占位清掉
+        await new Promise((r) => setTimeout(r, 400));
+        job = await api.getJob(created.id);
+        if (job.status !== 'running' && job.status !== 'queued') break;
+      }
     }
     const after = await api.sendMessage(created.id, '再补一句：我下个月要搬家');
     // 必须成功（不能 400），并且返回的对象能被 app.js 直接读

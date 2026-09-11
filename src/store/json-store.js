@@ -16,7 +16,17 @@ import path from 'node:path';
 /** id 白名单。这是防路径穿越的第一道闸，也是最关键的一道。 */
 export const JOB_ID_RE = /^job_[a-z0-9]{8,32}$/;
 
-/** 内存里最多留多少个 job（按 updatedAt 保留最新的） */
+/**
+ * 内存里最多留多少个 job（按 updatedAt 保留最新的）。
+ *
+ * 性能画像（实测，详见 docs/PERFORMANCE.md）：缓存的是**带交付物正文**的完整 job，
+ * 200 个 178KB 的任务 ≈ +66MB 常驻，500KB 级任务推算上限约 185MB。
+ *
+ * 试过"只让最近 30 个任务保留正文、更早的剥掉、getJob 时读盘补回来"，
+ * **已回退** —— 见文件末尾 `cachePut` 附近的注释。原因是那样会出现在
+ * "详情页拿到空正文"的路径上：**用户能不能看到自己的成果，不可交易。**
+ */
+
 const MAX_MEMORY_JOBS = 200;
 
 /** 内存缓存：id -> job。刷新页面时命中这里，不用读盘。 */
@@ -27,6 +37,20 @@ const chains = new Map();
 
 /** 启动加载只做一次 */
 let loadPromise = null;
+
+/**
+ * 记录「这份缓存是对哪个数据目录建的」。
+ *
+ * ⚠️ 这是个真实的工程坑（被 flaky 测试逼出来的）：
+ * 测试框架会把多个测试文件放在**同一个进程**里跑，每个文件都会把
+ * `HANDOFF_DATA_DIR` 指到自己的临时目录。如果没有这个守卫，第二个文件调用
+ * `loadFromDisk({force:true})` 时会**清空整份缓存**（缓存里是第一、三个文件的任务），
+ * 于是别的测试正在等的任务突然"读不到"了 —— 表现为随机失败，很难查。
+ *
+ * 生产环境不会遇到（进程只服务一个数据目录），但"多个数据目录共用一个进程"
+ * 是测试的常态，而且这个守卫本身零成本。
+ */
+let cacheForDataDir = null;
 
 /** 后台同步定时器（unref，不阻塞进程退出） */
 let syncTimer = null;
@@ -199,6 +223,26 @@ function cachePut(job) {
   return job;
 }
 
+/**
+ * ⚠️ 记录一次被否决的优化（2026-09-12，别再走一遍这条路）
+ *
+ * 性能工程师实测：缓存里存的是**带交付物正文的完整 job**，
+ * 一个 178KB 的任务 200 个就是 +66MB 常驻（500KB 级推算上限 185MB）。
+ * 看起来值得优化：只让最近 30 个任务在内存里留正文，更早的剥掉，
+ * `getJob` 命中无正文的条目时读盘补回来（一次读盘 p95 只有 4.86ms）。
+ *
+ * **试过，回退了。**原因：
+ *  · 剥离发生在 `cachePut` 里时，会**把正要返回给调用方的那份对象自己剥掉** ——
+ *    用户打开一个老任务，交付物是空白。这比多占 60MB 严重得多。
+ *  · 把剥离挪到"安全的时机"（loadFromDisk 之后 / listJobs 里）之后，
+ *    仍然出现了"详情页拿到空正文"的路径，排查成本已经超过收益。
+ *
+ * 结论：**"用户能不能看到自己的成果"是不可交易的。**内存上限 200 个任务、
+ * 最坏约 185MB 常驻，对这个"单机一个人用"的产品是可接受的代价。
+ * 如果你将来真要优化这里，请先补一条测试：
+ * **造 40 个带正文的任务，然后断言每一个的 `getJob().artifacts[0].content` 都完整。**
+ */
+
 function sortByUpdatedDesc(jobs) {
   return jobs.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
 }
@@ -225,6 +269,15 @@ async function readFileSafe(file) {
  * 只执行一次；并发调用共享同一个 promise。
  */
 export async function loadFromDisk({ force = false } = {}) {
+  // 数据目录换了 → 之前那份缓存属于别的目录，必须整体重建
+  const dir = getJobsDir();
+  if (cacheForDataDir !== null && cacheForDataDir !== dir) {
+    cache.clear();
+    loadPromise = null;
+    loadedOnce = false;
+  }
+  cacheForDataDir = dir;
+
   if (force) {
     loadPromise = null;
     loadedOnce = false;

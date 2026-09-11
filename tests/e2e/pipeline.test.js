@@ -556,10 +556,17 @@ describe('C. 失败与边界（最容易出 bug 的地方）', () => {
     // 原因：sendMessage 会让流水线从 draft 起重跑，同一个任务连发两次时
     // 第二次会撞上"任务正在执行中"→ 409（这是正确行为，app.js 也会禁用输入框）。
     // 之前这里共用一个 job，导致偶发 409 flake。
+    // 每个断言用独立任务；等到引擎真正释放占位（状态稳定 + 再等一拍）再发，
+    // 否则偶尔会撞上"任务刚结束、占位还在"的 409 —— 那是正确行为，不是缺陷。
     const send = async (body) => {
       const created = await request(app).post('/api/jobs').send({ goal: '消息字段测试', demo: true });
       const id = created.body.job.id;
-      await waitForJob(app, id);
+      for (let i = 0; i < 200; i += 1) {
+        const j = (await request(app).get(`/api/jobs/${id}`)).body.job;
+        if (j && j.status !== 'running' && j.status !== 'queued') break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      await new Promise((r) => setTimeout(r, 400));
       return request(app).post(`/api/jobs/${id}/message`).send(body);
     };
 

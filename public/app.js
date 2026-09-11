@@ -1289,17 +1289,38 @@ class JobView {
         submit.disabled = true;
         setText(submit, '正在发…');
         errBox.hidden = true;
-        try {
-          await api.sendMessage(job.id, value);
-          ta.value = '';
-          setText(status, '收到了，团队继续干活。这些字会出现在下面的日志里。');
-        } catch (err) {
-          errBox.hidden = false;
-          setText(errBox, friendlyError(err));
-        } finally {
-          submit.disabled = false;
-          setText(submit, '发给他们');
+        // 团队可能刚好还在处理上一句（服务端返回 409）。
+        // 对用户来说这只是"网络慢了一下"，不该看到一句报错然后自己再点一次 ——
+        // 我们替他等一小会儿重试。这是最典型的"该由产品承担、不该推给用户"的摩擦。
+        const transient = new Set(['HTTP_409', 'BAD_REQUEST']);
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          try {
+            await api.sendMessage(job.id, value);
+            ta.value = '';
+            setText(status, '收到了，团队继续干活。这些字会出现在下面的日志里。');
+            errBox.hidden = true;
+            break;
+          } catch (err) {
+            const code = err && err.code ? String(err.code) : '';
+            const isBusy = code === 'HTTP_409' || (err && err.status === 409);
+            if (isBusy && attempt < 3) {
+              setText(status, '团队还在忙上一句，稍等一下…');
+              await new Promise((r) => setTimeout(r, 1200));
+              continue;
+            }
+            errBox.hidden = false;
+            setText(errBox, friendlyError(err));
+            break;
+          } finally {
+            if (attempt === 3 || !errBox.hidden) {
+              submit.disabled = false;
+              setText(submit, '发给他们');
+            }
+          }
         }
+        submit.disabled = false;
+        setText(submit, '发给他们');
+        void transient;
       };
       submit.addEventListener('click', send);
       ta.addEventListener('keydown', (ev) => {
