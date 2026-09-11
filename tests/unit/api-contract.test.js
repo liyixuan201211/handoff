@@ -195,6 +195,24 @@ describe('接线：新用户的第一屏到看完结果', () => {
     expect(final.artifacts.length).toBeGreaterThan(0);
   }, 40_000);
 
+  it('列表项必须带 stageCount（否则历史卡片会同时显示"已完成"和"准备中"）', async () => {
+    // 真实出现过的界面缺陷：徽章读 status → 写「已完成」，
+    // 旁边的 chip 读 `job.stages.length` → 列表接口没给 stages → 写「准备中」。
+    // 用户看到同一张卡片自己打自己脸，会以为任务出了问题。
+    const created = await api.createJob({ goal: '接线测试：列表字段完整性', demo: true });
+    for (let i = 0; i < 200; i += 1) {
+      const j = await api.getJob(created.id);
+      if (j.status !== 'running' && j.status !== 'queued') break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const jobs = await api.listJobs();
+    const mine = jobs.find((j) => j.id === created.id);
+    expect(mine).toBeTruthy();
+    expect(typeof mine.stageCount).toBe('number');
+    expect(mine.stageCount).toBeGreaterThan(0);
+    expect(typeof mine.artifactCount).toBe('number');
+  }, 40_000);
+
   it('历史列表的每一张卡片都能读出目标与状态（不能是"准备中"配"已完成"）', async () => {
     await api.createJob({ goal: '接线测试：卡片字段', demo: true });
     const jobs = await api.listJobs();

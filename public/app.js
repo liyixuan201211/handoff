@@ -244,6 +244,28 @@ function newTaskForm(opts) {
     clearDraft() { ta.value = ''; updateCount(); },
   };
 
+  // 「看一个演示」是**不知道说什么的新用户第一个会点的按钮**。
+  // 以前它直接把空输入框的内容交出去，于是弹「先写一句话，说明你想要什么」——
+  // 等于对最需要帮助的人说"你先自己想清楚"。现在：
+  //   · 输入框空着 → 用一句内置的示例委托，演示照样能看
+  //   · 输入框有内容 → 用他自己写的，演示内容与他的问题一致
+  const DEMO_FALLBACK_GOAL =
+    '帮我把这份租房合同看一遍，我怕有坑。押金两个月6000元，租期一年，提前退租押金不退，水电燃气租客承担，维修超200元租客承担。';
+
+  const runDemo = () => {
+    const typed = ta.value.trim();
+    if (!typed) {
+      ta.value = DEMO_FALLBACK_GOAL;
+      ta.dispatchEvent(new Event('input'));
+    }
+    submitNewJob(typed || DEMO_FALLBACK_GOAL, {
+      audience: audience.value,
+      tone: tone.value,
+      templateId: o.templateId || undefined,
+      demo: true,
+    }, ui);
+  };
+
   const run = (demoMode) => submitNewJob(ta.value, {
     audience: audience.value,
     tone: tone.value,
@@ -252,7 +274,7 @@ function newTaskForm(opts) {
   }, ui);
 
   submit.addEventListener('click', () => run(false));
-  demo.addEventListener('click', () => run(true));
+  demo.addEventListener('click', runDemo);
   ta.addEventListener('keydown', (ev) => {
     // Enter 直接提交，Shift+Enter 换行 —— 少让用户点一次
     if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
@@ -350,12 +372,12 @@ function renderHome(main, state) {
   textarea.value = state && state.draftGoal ? state.draftGoal : '';
   page.appendChild(form);
 
-  page.appendChild(el('section', { class: 'ribbon-wrap', 'aria-label': '我们怎么工作' }, [
-    text('h2', 'section-title', '这不是一次问答，是一支团队在干活'),
-    text('p', 'section-sub', '八个步骤固定成一条流水线，你可以随时看到谁在忙、忙了多久。'),
-    pipelineRibbon(),
-  ]));
-
+  // ⚠️ 顺序是刻意的：**场景模板紧跟在输入框下面**，产品介绍排在更后面。
+  //
+  // 原来的顺序是 输入框 → 产品介绍（八步流水线）→ 场景模板，
+  // 结果最需要帮助的那批用户（打开页面、看着空输入框、不知道该说什么）
+  // 要滚动一屏多才能看到"挑一个常见场景"——而那正是唯一能救他们的东西。
+  // 会写字的人会直接往输入框里打字，根本不看模板；所以模板必须放在他们前面。
   const tplSection = el('section', { class: 'tpl-wrap' }, [
     text('h2', 'section-title', '不知道怎么说？挑一个常见场景'),
     text('p', 'section-sub', '点一下就会填进上面的框里，你还可以改成自己的说法。'),
@@ -387,6 +409,14 @@ function renderHome(main, state) {
     }
   }
   page.appendChild(tplSection);
+
+  // 产品介绍排在场景模板**之后**：会写字的人不需要它，
+  // 不知道说什么的人要先看到能救命的那一屏。
+  page.appendChild(el('section', { class: 'ribbon-wrap', 'aria-label': '我们怎么工作' }, [
+    text('h2', 'section-title', '这不是一次问答，是一支团队在干活'),
+    text('p', 'section-sub', '八个步骤固定成一条流水线，你可以随时看到谁在忙、忙了多久。'),
+    pipelineRibbon(),
+  ]));
 
   page.appendChild(el('section', { class: 'trust' }, [
     el('h2', { class: 'trust-title' }, '放心用的几件事'),
@@ -434,7 +464,15 @@ function jobCard(job) {
       ]),
     ]),
     el('div', { class: 'job-card-foot' }, [
-      el('span', { class: 'chip' }, (job.stages && job.stages.length ? job.stages.length + ' 个步骤' : '准备中')),
+      // ⚠️ 列表接口给的是 `stageCount`（轻量摘要里没有完整 `stages` 数组，省响应体积）。
+      // 这里以前只读 `job.stages`，于是历史卡片上会出现自相矛盾的一行：
+      // 徽章写着「已完成」，旁边却写「准备中」—— 同一个卡片自己打自己脸。
+      // 三个来源依次兜底：完整 stages → stageCount → （真的还没有）准备中。
+      el('span', { class: 'chip' }, (() => {
+        const n = (job.stages && job.stages.length)
+          || (typeof job.stageCount === 'number' ? job.stageCount : 0);
+        return n > 0 ? n + ' 个步骤' : '准备中';
+      })()),
       job.plan && job.plan.title ? el('span', { class: 'chip' }, summarize(job.plan.title, 24)) : null,
       el('time', { class: 'muted mono', datetime: new Date(job.createdAt || Date.now()).toISOString() },
         formatRelative(job.createdAt, Date.now())),
@@ -526,6 +564,13 @@ class JobView {
 
     this.banner = connectionBanner('connecting');
     page.appendChild(this.banner);
+
+    // 演示模式提示条。为什么需要它：
+    // 演示模式用的是**内置样例内容**（固定的租房合同审查），跟用户实际问的问题无关。
+    // 不明说的话，用户会以为"它答非所问"——那比不做演示还糟。
+    // 诚实说明比假装聪明好。
+    this.demoNote = el('div', { class: 'demo-note', hidden: true, role: 'note' });
+    page.appendChild(this.demoNote);
 
     this.head = el('section', { class: 'job-head', 'aria-label': '任务概况' });
     page.appendChild(this.head);
@@ -858,6 +903,22 @@ class JobView {
     if (headKey === this.headKey) return;
     this.headKey = headKey;
     clear(this.head);
+
+    if (this.demoNote) {
+      clear(this.demoNote);
+      if (job.demo) {
+        this.demoNote.hidden = false;
+        this.demoNote.appendChild(
+          text(
+            'p',
+            'demo-note-text',
+            '这是演示：为了方便你快速看到流程，下面所有的内容都是内置的样例（一份租房合同），和你在输入框里写的问题无关。想看跟你自己问题相关的结果，回首页把问题写完整再点「开始，交给团队」。',
+          ),
+        );
+      } else {
+        this.demoNote.hidden = true;
+      }
+    }
 
     const meta = statusLabel(job.status);
     this.head.appendChild(el('div', { class: 'job-head-top' }, [

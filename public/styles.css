@@ -154,6 +154,17 @@ button { font: inherit; color: inherit; }
 }
 .tpl-hint-tips { margin: 0; color: var(--text-2); font-size: .9rem; line-height: 1.7; }
 
+/* 演示模式提示条：明说"这是样例，跟你的问题无关"。
+   不写清楚的话，用户会以为产品答非所问 —— 那比不做演示还糟。 */
+.demo-note {
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--warn);
+  border-radius: var(--r-sm);
+  background: var(--warn-bg);
+}
+.demo-note-text { margin: 0; color: var(--warn); font-size: .9rem; line-height: 1.7; }
+
 .sr-only {
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;

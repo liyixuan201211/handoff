@@ -739,6 +739,8 @@ describe('CSS 一致性：新加的类名必须在 styles.css 里有定义', () 
     'tpl-hint-notice',
     'tpl-hint-tips',
     'tpl-grid',
+    'demo-note',
+    'demo-note-text',
     'tpl-title',
     'tpl-desc',
   ];
