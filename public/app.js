@@ -16,7 +16,7 @@ import {
   el, clear, setText, setRenderedMarkdown, statusBadge, stageCard, pipelineRibbon,
   skeleton, emptyState, failureState, connectionBanner,
 } from './ui.js';
-import { createApi, friendlyError, FALLBACK_TEMPLATES } from './api.js';
+import { createApi, friendlyError, friendlyJobError, FALLBACK_TEMPLATES } from './api.js';
 
 const api = createApi({});
 
@@ -825,7 +825,11 @@ class JobView {
       return;
     }
     if (evt.type === 'error') {
-      if (job) { job.status = 'failed'; job.error = { message: evt.message, stageId: evt.stageId || null }; }
+      if (job) {
+        job.status = 'failed';
+        // 带上 code（服务端 error 事件里有），否则前端只能靠消息文本猜，翻不出人话
+        job.error = { code: evt.code || null, message: evt.message, stageId: evt.stageId || null };
+      }
       this.patchHead();
       this.patchActions();
       const card = evt.stageId ? this.stageNodes.get(evt.stageId) : null;
@@ -1472,7 +1476,10 @@ class JobView {
       this.actionBox.appendChild(failureState({
         title: '这一步没做成，但之前做的都留着',
         where: stageTitle,
-        why: (job.error && job.error.message) ? String(job.error.message) : '模型那边没能给出结果。',
+        // ⚠️ 必须过 friendlyJobError。job.error.message 直接来自 llm/gateway.js，
+        // 里面可能是「模型输出的结构不符合要求：$.confidence 取值必须是 high/medium/low 之一」。
+        // 以前这句是**原样显示**给用户的 —— 而失败卡片正是用户最容易放弃的那一刻。
+        why: friendlyJobError(job.error),
         next: '不用重头再来。点下面的按钮，团队会从卡住的那一步接着做，前面已经完成的部分不会丢。',
         onRetry: () => this.retry(),
         onNew: () => { location.hash = '#/new'; },

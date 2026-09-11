@@ -14,7 +14,7 @@ import {
   ROLE_BY_STAGE,
 } from '../../public/ui.js';
 
-import { createApi, FALLBACK_TEMPLATES, friendlyError } from '../../public/api.js';
+import { createApi, FALLBACK_TEMPLATES, friendlyError, friendlyJobError, ERROR_COPY } from '../../public/api.js';
 import { buildGoalFromTemplate, renderTemplateHint } from '../../public/app.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -750,4 +750,90 @@ describe('CSS 一致性：新加的类名必须在 styles.css 里有定义', () 
       expect(css).toContain(`.${cls}`);
     });
   }
+});
+
+/* ================================================================== *
+ * 错误消息翻译（P0：失败卡片是用户最容易放弃的那一刻）
+ *
+ * 背景：流水线失败时，`job.error.message` 直接来自 src/llm/gateway.js，
+ * 而它以前是**原样显示**给用户的。用户会看到：
+ *   「模型输出的结构不符合要求：$.confidence 取值必须是 high/medium/low 之一，实际是 0.95」
+ * 而 frontend 的 friendlyError 映射表里有三个**服务端从不产生**的码
+ * （VALIDATION_ERROR / JOB_NOT_FOUND / LLM_ALL_PROVIDERS_FAILED），
+ * 却漏了服务端最常抛的 LLM_NO_PROVIDER —— 所以那些错误全都落到兜底分支，
+ * 把技术消息原样吐出去。
+ * ================================================================== */
+describe('错误消息翻译：每个服务端错误码都要有人话', () => {
+  it('ERROR_COPY 必须覆盖 src/llm/errors.js 里 ERR 表的所有码', async () => {
+    const { ERR } = await import('../../src/llm/errors.js');
+    const missing = Object.values(ERR).filter((code) => !ERROR_COPY[code]);
+    // 这条断言就是"别再写凭印象的映射表"的护栏：
+    // 服务端加了新错误码而前端没翻译，这里立刻红。
+    expect(missing).toEqual([]);
+  });
+
+  it('ERROR_COPY 里不该有服务端不存在的码（死文案）', async () => {
+    const { ERR } = await import('../../src/llm/errors.js');
+    // 这些码不是来自 ERR 表，但确实会产生：
+    //   · 前端自己产生的：NETWORK_ERROR / TIMEOUT / BAD_JSON
+    //   · engine 的 failJob() 会写 INTERRUPTED / PIPELINE_STAGE_FAILED
+    //   · server 的兜底中间件会写 INTERNAL_ERROR
+    //   · 早期的旧码（VALIDATION_ERROR / JOB_NOT_FOUND / LLM_ALL_PROVIDERS_FAILED）
+    //     保留翻译是为了兼容浏览器里缓存的旧响应，但**前端的请求已经不再产生它们**。
+    const known = new Set([
+      ...Object.values(ERR),
+      'NETWORK_ERROR', 'TIMEOUT', 'BAD_JSON',
+      'INTERNAL_ERROR', 'INTERRUPTED',
+      'VALIDATION_ERROR', 'JOB_NOT_FOUND', 'LLM_ALL_PROVIDERS_FAILED',
+    ]);
+    const dead = Object.keys(ERROR_COPY).filter((code) => !known.has(code));
+    expect(dead).toEqual([]);
+  });
+
+  it('每个翻译都是一句人话：不含技术符号、不说"未知错误"', () => {
+    for (const [code, text] of Object.entries(ERROR_COPY)) {
+      expect(typeof text).toBe('string');
+      expect(text.length, code).toBeGreaterThan(6);
+      // 不能把错误码本身当文案
+      expect(text, code).not.toBe(code);
+      // 不能出现技术味很重的符号
+      expect(text, code).not.toMatch(/[$#{}[\]<>]/);
+      // 不能是"未知错误"这类没信息量的说法
+      expect(text, code).not.toMatch(/未知错误|unknown error/i);
+    }
+  });
+
+  it('friendlyError 认带 HTTP_ 前缀的码（服务端拼出来的形式）', () => {
+    expect(friendlyError({ code: 'HTTP_404' })).toContain('找不到');
+    expect(friendlyError({ code: 'HTTP_429' })).toContain('快');
+  });
+
+  it('friendlyJobError 会把技术味的 job.error.message 换成一句人话', () => {
+    const technical = {
+      code: 'LLM_SCHEMA_INVALID',
+      message: '模型输出的结构不符合要求：$.confidence 取值必须是 high/medium/low 之一，实际是 0.95',
+    };
+    const out = friendlyJobError(technical);
+    expect(out).not.toContain('$');
+    expect(out).not.toContain('confidence');
+    expect(out).toContain('重'); // 给出下一步动作（重试/重做）
+  });
+
+  it('friendlyJobError 遇到已经写好的中文用户文案时，原样保留（不要过度翻译）', () => {
+    const good = { code: null, message: '这次运行被中断了（服务被关闭或电脑休眠）。已经做好的部分都保留在上面，点「重试」可以接着做完。' };
+    expect(friendlyJobError(good)).toBe(good.message);
+  });
+
+  it('friendlyJobError 对空值 / 畸形输入不崩', () => {
+    for (const bad of [null, undefined, {}, { message: '' }, 'x', 42]) {
+      expect(() => friendlyJobError(bad)).not.toThrow();
+      expect(friendlyJobError(bad).length).toBeGreaterThan(4);
+    }
+  });
+
+  it('未知错误码不会把英文技术消息甩给用户', () => {
+    const out = friendlyJobError({ code: 'SOME_NEW_CODE', message: 'TypeError: Cannot read properties of undefined' });
+    expect(out).not.toContain('TypeError');
+    expect(out).toContain('重试');
+  });
 });

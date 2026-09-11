@@ -18,24 +18,109 @@ export const FALLBACK_TEMPLATES = [
   { id: 'summarize-doc', title: '把这份长资料读成三分钟能看完的摘要', desc: '提炼要点、结论和你要做的下一步。', icon: '赵', role: '调研员' },
 ];
 
+/**
+ * 错误码 → 人话。
+ *
+ * ⚠️ 这张表以前是坏的：它映射的 `VALIDATION_ERROR` / `JOB_NOT_FOUND` /
+ * `LLM_ALL_PROVIDERS_FAILED` **在服务端根本不存在**（是凭印象写的），
+ * 而服务端最常抛的 `LLM_NO_PROVIDER`、`INTERRUPTED`、`LLM_EMPTY_RESPONSE`
+ * 一个都没有 —— 于是它们全部落到兜底分支，把技术消息原样吐给用户。
+ *
+ * 现在这份清单**逐条对齐 `src/llm/errors.js` 的 ERR 表**。
+ * 新增错误码时两边要一起改；`tests/unit/frontend.test.js` 有断言守着这份对齐。
+ */
+export const ERROR_COPY = {
+  // —— 请求本身的问题（用户能自己修）——
+  BAD_REQUEST: '这条内容我们收不了，检查一下是不是空着或者格式不对。',
+  VALIDATION_ERROR: '有一项没填对，检查一下输入框里的内容。',
+  RATE_LIMITED: '你点得有点快，等一分钟再来就好。',
+  PAYLOAD_TOO_LARGE: '这次发的内容太长了。拆成两三次发，或者只把最要紧的部分发过来。',
+  NOT_FOUND: '这个任务找不到了，可能已经被删掉。',
+  JOB_NOT_FOUND: '这个任务找不到了，可能已经被删掉。',
+  INTERNAL_ERROR: '我们这边出了点问题，已经记下来了。可以重试一次。',
+
+  // —— 模型那边的问题（用户只能等或重试）——
+  LLM_TIMEOUT: '模型这次想得太久了，我们没继续等。点重试通常就好了。',
+  LLM_HTTP_ERROR: '连模型服务的时候卡住了。检查一下网络，然后重试。',
+  LLM_NO_PROVIDER: '所有模型都没能连上。检查一下网络和 API Key，然后重试。',
+  LLM_EMPTY_RESPONSE: '模型这次没写出东西来，重试一次通常就好。',
+  LLM_JSON_INVALID: '模型这次答得乱七八糟，我们已经让它重做了。再试一次。',
+  LLM_SCHEMA_INVALID: '模型这次没按规矩答题，我们已经让它重做了。再试一次。',
+  LLM_ABORTED: '这个任务被取消了。',
+  LLM_ALL_PROVIDERS_FAILED: '所有模型都没能连上。检查一下网络和 API Key，然后重试。',
+
+  // —— 流水线与进程状态 ——
+  PIPELINE_STAGE_FAILED: '有一步没做成，但前面做好的东西都留着。点重试可以接着做。',
+  PIPELINE_CANCELLED: '这个任务被取消了。',
+  INTERRUPTED: '这次运行被中断了（服务被关闭或者电脑休眠）。做好的部分都还在，点重试可以接着做完。',
+  SECURITY_BLOCKED: '这次的内容被安全检查拦下来了。如果你觉得不该拦，可以换个说法再试。',
+
+  // —— 网络层（前端自己产生的码）——
+  NETWORK_ERROR: '连不上本机的服务，确认程序还在运行。',
+  TIMEOUT: '等太久了，还没等到回应。可以重试一次。',
+  BAD_JSON: '服务返回的内容看不懂，稍后再试。',
+};
+
+/** HTTP 状态码 → 人话（按类别，不逐条罗列） */
+export function httpStatusCopy(status) {
+  const n = Number(status);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n === 404) return ERROR_COPY.NOT_FOUND;
+  if (n === 413) return ERROR_COPY.PAYLOAD_TOO_LARGE;
+  if (n === 429) return ERROR_COPY.RATE_LIMITED;
+  if (n >= 500) return ERROR_COPY.INTERNAL_ERROR;
+  if (n >= 400) return ERROR_COPY.BAD_REQUEST;
+  return '';
+}
+
 /** 把后端错误对象翻译成普通人能看懂的一句话。 */
 export function friendlyError(err) {
   const code = err && err.code ? String(err.code) : '';
-  const table = {
-    RATE_LIMITED: '你操作得有点快，等一分钟再试就好。',
-    PAYLOAD_TOO_LARGE: '这次发的内容太长了，拆成两三次发可能更好。',
-    VALIDATION_ERROR: '有一项没填对，检查一下输入框里的内容。',
-    JOB_NOT_FOUND: '这个任务找不到了，可能已经被删掉。',
-    LLM_TIMEOUT: '模型那边响应太慢，可以先重试一次。',
-    LLM_ALL_PROVIDERS_FAILED: '所有模型都没连上，检查一下网络，我们待会儿再试。',
-    NETWORK_ERROR: '连不上本机的服务，确认程序还在运行。',
-    BAD_JSON: '服务返回的内容看不懂，稍后再试。',
-  };
-  if (table[code]) return table[code];
+  if (ERROR_COPY[code]) return ERROR_COPY[code];
+
+  // 有些码是 HTTP_404 这种由状态码拼出来的形式。
+  // 注意：去掉前缀后拿到的是 "404" 这个**数字字符串**，ERROR_COPY 里没有这个键，
+  // 所以要单独按状态码类别翻译 —— 否则「任务不存在」会被说成「出了点问题」，
+  // 用户就不知道该干什么了。
+  const bare = code.replace(/^HTTP_/, '');
+  if (bare && ERROR_COPY[bare]) return ERROR_COPY[bare];
+  const statusCopy = httpStatusCopy(err && err.status ? err.status : Number(bare));
+  if (statusCopy) return statusCopy;
+
   const msg = err && err.message ? String(err.message) : '';
+  // 全大写的消息多半是错误码而不是人话，别直接甩给用户
   if (msg && !/^[A-Z_]+$/.test(msg)) return msg;
   if (msg) return '出了点问题（' + msg + '），可以重试一次。';
   return '出了点问题，可以重试一次。';
+}
+
+/**
+ * 把**流水线失败时记在 job.error 里的那句话**翻成人话。
+ *
+ * 为什么需要单独一个函数：`friendlyError` 处理的是"请求失败了"，
+ * 而这里处理的是"任务跑到一半失败了"—— 两者的消息来源不同。
+ * job.error.message 直接来自 `src/llm/gateway.js`，里面可能是
+ * 「模型输出的结构不符合要求：$.confidence 取值必须是 high/medium/low 之一，实际是 0.95」
+ * 这种东西。用户看到只会一脸问号，所以必须在展示前过一遍。
+ *
+ * @param {{code?:string, message?:string}|null} error job.error
+ * @returns {string} 给用户看的一句话
+ */
+export function friendlyJobError(error) {
+  if (!error) return '这次没能做完，可以点重试。';
+  const code = error.code ? String(error.code) : '';
+  if (ERROR_COPY[code]) return ERROR_COPY[code];
+  const bare = code.replace(/^HTTP_/, '');
+  if (bare && ERROR_COPY[bare]) return ERROR_COPY[bare];
+  const byStatus = httpStatusCopy(error.status ? error.status : Number(bare));
+  if (byStatus) return byStatus;
+  // 没有认识的码：看看消息本身像不像人话。
+  // 我们对自家文案有信心的一点是：**中文消息都是写好的用户文案**，
+  // 而带 $ . _ { } 这些符号、或者夹着英文错误码的，都是技术消息。
+  const msg = String(error.message || '');
+  const looksTechnical = /[$]|\{|\}|_|Error|error|undefined|null|[A-Z]{3,}_[A-Z]/.test(msg);
+  if (msg && !looksTechnical) return msg;
+  return '这次没能做完。原因已经记下来了，点重试通常就好了。';
 }
 
 /**
@@ -287,4 +372,4 @@ export function createApi(options) {
   };
 }
 
-export default { createApi, FALLBACK_TEMPLATES, friendlyError };
+export default { createApi, FALLBACK_TEMPLATES, friendlyError, friendlyJobError, ERROR_COPY };
