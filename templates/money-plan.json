@@ -1,0 +1,14 @@
+{
+  "id": "money-plan",
+  "title": "帮我算清一笔账",
+  "emoji": "🧾",
+  "category": "家庭理财",
+  "description": "房贷、装修、开店、攒钱——把复杂数字算成能看懂的结论。",
+  "placeholders": [
+    { "key": "question", "label": "你想算什么", "example": "提前还房贷20万划不划算" },
+    { "key": "numbers", "label": "相关的数字", "example": "贷款剩80万，利率4.2%，还剩18年，手里闲钱20万，理财大概能拿2.5%" }
+  ],
+  "goalTemplate": "帮我算清楚一个问题：{{question}}。相关数字：{{numbers}}。请给出结论和推荐做法，并把计算过程写清楚让我能看懂。",
+  "tips": "数字写个大概也行，但利率和年限尽量准一点。",
+  "sort": 60
+}

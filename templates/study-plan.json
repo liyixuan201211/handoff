@@ -1,0 +1,16 @@
+{
+  "id": "study-plan",
+  "title": "帮我做个学习计划",
+  "emoji": "📚",
+  "category": "学习成长",
+  "description": "考证、学英语、自学一门手艺——把大目标拆成每天能干的小事。",
+  "placeholders": [
+    { "key": "goal", "label": "想学什么/考什么", "example": "考初级会计证" },
+    { "key": "days", "label": "还有多少天", "example": "90天" },
+    { "key": "time", "label": "每天能挤出多少时间", "example": "晚上1小时，周末3小时" },
+    { "key": "level", "label": "现在的基础", "example": "完全没接触过会计" }
+  ],
+  "goalTemplate": "帮我制定一个学习计划。目标：{{goal}}。距离考试/目标还有{{days}}。我每天能投入的时间：{{time}}。我目前的基础：{{level}}。请给我一个具体到每天做什么的计划表。",
+  "tips": "说实话就好。时间写得越准，计划越能坚持下来。",
+  "sort": 40
+}

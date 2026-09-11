@@ -1,0 +1,15 @@
+{
+  "id": "teach-material",
+  "title": "帮我做一份教学/讲解材料",
+  "emoji": "🍎",
+  "category": "工作挣钱",
+  "description": "老师、培训师、带新人的老员工——把你会的东西变成别人能听懂的讲义。",
+  "placeholders": [
+    { "key": "topic", "label": "要讲什么", "example": "分数的加减法" },
+    { "key": "audience", "label": "讲给谁听", "example": "小学五年级学生" },
+    { "key": "duration", "label": "讲多久", "example": "一节课40分钟" }
+  ],
+  "goalTemplate": "帮我做一份讲解材料。主题：{{topic}}。听众：{{audience}}。时长：{{duration}}。请包含：讲课提纲、每个环节的时间分配、的例子、以及3个可以提问的问题。",
+  "tips": "把学生的具体困难写进去（比如「他们总忘记通分」），材料会更对症。",
+  "sort": 70
+}

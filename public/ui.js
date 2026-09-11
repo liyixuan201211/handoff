@@ -1,0 +1,678 @@
+/**
+ * Handoff — UI 纯函数层（[S5] 前端工程师）
+ *
+ * 硬约束：本文件**绝不允许**出现顶层 DOM / window / document 访问。
+ * 原因：测试要在 Node 里 `import` 它（tests/unit/frontend.test.js）。
+ * 所有 DOM 操作都必须放在函数体内，并用 `typeof document !== 'undefined'` 保护。
+ *
+ * 导出分四块：
+ *   1. 安全层：escapeHtml / safeHref / stripControlChars
+ *   2. markdown 渲染器：renderMarkdown（先按行处理 → 逐段 escapeHtml → 再插标签）
+ *   3. 状态工具：statusLabel / statusTone / roleMeta / formatElapsed / hash 路由解析
+ *   4. store：极简订阅式状态容器（无全局散落变量）
+ */
+
+/* ------------------------------------------------------------------ *
+ * 1. 安全层
+ * ------------------------------------------------------------------ */
+
+/**
+ * HTML 转义。任何进入 DOM 的动态文本都必须先过这里。
+ * 转义 & < > " ' ` = 六个字符，足以阻断标签注入与属性逃逸。
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function escapeHtml(value) {
+  if (value === null || value === undefined) return '';
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/`/g, '&#96;');
+}
+
+/** 剥掉控制字符（含 \u0000-\u001f，保留 \n \t），用于不可信文本进日志/URL 前。 */
+export function stripControlChars(value) {
+  if (value === null || value === undefined) return '';
+  // eslint-disable-next-line no-control-regex
+  return String(value).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '');
+}
+
+/**
+ * 链接白名单。只有 http / https / mailto 允许成为 href。
+ * 其余（javascript:、data:、vbscript:、file: …）一律返回 null，
+ * 调用方必须把它当纯文本渲染。
+ * 额外防御：去掉协议名里的控制字符/空白（`java\nscript:` 这种绕过手法）。
+ * @param {unknown} raw
+ * @returns {string|null}
+ */
+export function safeHref(raw) {
+  if (raw === null || raw === undefined) return null;
+  let url = String(raw).trim();
+  if (!url) return null;
+  // 去掉所有控制字符与内嵌空白后再判定协议，防 `java\tscript:` / `java\nscript:`
+  const probe = url.replace(/[\u0000-\u0020\u007f]/g, '').toLowerCase();
+  if (probe.startsWith('javascript:') || probe.startsWith('data:') ||
+      probe.startsWith('vbscript:') || probe.startsWith('file:') ||
+      probe.startsWith('blob:')) {
+    return null;
+  }
+  if (/^https?:\/\//i.test(url)) return stripControlChars(url);
+  if (/^mailto:/i.test(url)) return stripControlChars(url);
+  return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * 2. 最小 markdown 渲染器
+ * ------------------------------------------------------------------ */
+
+const MARKER = '\u0000HANDOFF-MD-';
+
+/**
+ * 行内渲染。**调用前必须已经 escapeHtml 过**（本函数只负责插标签）。
+ * 顺序：粗体 → 链接 → 斜体 → 行内代码。
+ */
+function inline(escapedText, codeBlocks) {
+  let out = escapedText;
+
+  // **粗体** / __粗体__
+  out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  out = out.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+
+  // [文本](链接) —— href 走白名单；不合法则退化成纯文本（文本 + 括号原样）
+  out = out.replace(/\[([^\]]*)\]\(([^()\s]+)\)/g, (whole, label, href) => {
+    const safe = safeHref(unescapeBasic(href));
+    if (!safe) return whole;
+    return '<a href="' + escapeHtml(safe) + '" target="_blank" rel="noopener noreferrer nofollow">' + label + '</a>';
+  });
+
+  // *斜体*（不跨行、不吞掉列表符号）
+  out = out.replace(/(^|[^*\w])\*([^*\n]+)\*(?=[^*\w]|$)/g, '$1<em>$2</em>');
+
+  // `行内代码`
+  out = out.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  // 还原代码块占位符（占位符本身不含用户数据）
+  out = out.replace(/\u0000HANDOFF-MD-(\d+)\u0000/g, (whole, idx) => {
+    const block = codeBlocks[Number(idx)];
+    return block === undefined ? '' : block;
+  });
+
+  return out;
+}
+
+/** 把已经 escapeHtml 过的属性值还原成近似原文，仅用于安全校验（不用于输出）。 */
+function unescapeBasic(s) {
+  return String(s)
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#96;/g, '`');
+}
+
+/**
+ * 渲染 markdown 为**已转义**的 HTML 字符串。
+ *
+ * 流程（不可颠倒）：
+ *   1. 按行切分源码
+ *   2. ``` 围栏内的内容整体 escapeHtml 后放进 <pre><code>，以占位符代替
+ *   3. 其余每一段文本**先 escapeHtml**，再包裹标签
+ * 绝不"先拼 HTML 再转义"。
+ *
+ * @param {unknown} src
+ * @returns {string} 可安全交给 innerHTML 的字符串
+ */
+export function renderMarkdown(src) {
+  if (src === null || src === undefined) return '';
+  const text = stripControlChars(String(src)).replace(/\r\n?/g, '\n');
+  if (!text.trim()) return '';
+
+  const codeBlocks = [];
+  const lines = text.split('\n');
+  const out = [];
+
+  let para = [];
+  let listType = null;   // 'ul' | 'ol'
+  let quote = [];
+
+  const flushPara = () => {
+    if (!para.length) return;
+    const body = para
+      .map((l) => inline(escapeHtml(l), codeBlocks))
+      .join('<br>');
+    out.push('<p>' + body + '</p>');
+    para = [];
+  };
+  const flushList = () => {
+    if (listType) { out.push('</' + listType + '>'); listType = null; }
+  };
+  const flushQuote = () => {
+    if (!quote.length) return;
+    const body = quote.map((l) => inline(escapeHtml(l), codeBlocks)).join('<br>');
+    out.push('<blockquote>' + body + '</blockquote>');
+    quote = [];
+  };
+  const flushAll = () => { flushPara(); flushList(); flushQuote(); };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i];
+    const line = raw.replace(/\s+$/, '');
+
+    // 代码围栏
+    const fence = line.match(/^\s*(```+|~~~+)\s*([A-Za-z0-9+#._-]*)\s*$/);
+    if (fence) {
+      flushAll();
+      const marker = fence[1][0];
+      const lang = fence[2] || '';
+      const body = [];
+      i += 1;
+      while (i < lines.length && !new RegExp('^\\s*' + marker + '{3,}\\s*$').test(lines[i])) {
+        body.push(lines[i]);
+        i += 1;
+      }
+      // 未闭合也安全：i 会越界，循环自然结束
+      const cls = lang ? ' class="lang-' + escapeHtml(lang).replace(/[^A-Za-z0-9_-]/g, '') + '"' : '';
+      codeBlocks.push('<pre><code' + cls + '>' + escapeHtml(body.join('\n')) + '</code></pre>');
+      out.push(MARKER + (codeBlocks.length - 1) + '\u0000');
+      continue;
+    }
+
+    // 空行 = 段落分隔
+    if (!line.trim()) { flushAll(); continue; }
+
+    // 分隔线
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+      flushAll();
+      out.push('<hr>');
+      continue;
+    }
+
+    // 标题
+    const h = line.match(/^\s{0,3}(#{1,6})\s+(.*)$/);
+    if (h) {
+      flushAll();
+      const level = h[1].length;
+      out.push('<h' + level + '>' + inline(escapeHtml(h[2].replace(/\s+#+\s*$/, '')), codeBlocks) + '</h' + level + '>');
+      continue;
+    }
+
+    // 引用
+    const q = line.match(/^\s*>\s?(.*)$/);
+    if (q) {
+      flushPara(); flushList();
+      quote.push(q[1]);
+      continue;
+    }
+
+    // 有序列表
+    const ol = line.match(/^\s*(\d+)[.)]\s+(.*)$/);
+    if (ol) {
+      flushPara(); flushQuote();
+      if (listType !== 'ol') { flushList(); out.push('<ol>'); listType = 'ol'; }
+      out.push('<li>' + inline(escapeHtml(ol[2]), codeBlocks) + '</li>');
+      continue;
+    }
+
+    // 无序列表
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (ul) {
+      flushPara(); flushQuote();
+      if (listType !== 'ul') { flushList(); out.push('<ul>'); listType = 'ul'; }
+      out.push('<li>' + inline(escapeHtml(ul[1]), codeBlocks) + '</li>');
+      continue;
+    }
+
+    // 普通段落行：接在列表/引用后面也算新段落，交给 flushAll 处理
+    flushList(); flushQuote();
+    para.push(line);
+  }
+
+  flushAll();
+  return out.join('\n');
+}
+
+/* ------------------------------------------------------------------ *
+ * 3. 状态 / 文案 / 时间 / 路由
+ * ------------------------------------------------------------------ */
+
+export const ROLE_BY_STAGE = {
+  intake: '接待员',
+  plan: '项目经理',
+  research: '调研员',
+  draft: '执行专员',
+  critique: '审查员',
+  revise: '执行专员',
+  verify: '质检员',
+  deliver: '交付专员',
+};
+
+export const STAGE_TITLE_BY_KEY = {
+  intake: '理解需求',
+  plan: '制定方案',
+  research: '查资料',
+  draft: '动手做',
+  critique: '挑毛病',
+  revise: '改稿',
+  verify: '验收',
+  deliver: '打包交付',
+};
+
+const JOB_STATUS = {
+  queued: { label: '排队中', tone: 'wait' },
+  running: { label: '进行中', tone: 'work' },
+  awaiting_input: { label: '等待你的回答', tone: 'ask' },
+  done: { label: '已完成', tone: 'ok' },
+  failed: { label: '失败', tone: 'bad' },
+  cancelled: { label: '已取消', tone: 'wait' },
+};
+
+const STAGE_STATUS = {
+  pending: { label: '等待中', tone: 'wait' },
+  running: { label: '工作中', tone: 'work' },
+  done: { label: '已完成', tone: 'ok' },
+  failed: { label: '失败', tone: 'bad' },
+  skipped: { label: '已跳过', tone: 'wait' },
+};
+
+/** @returns {{label:string, tone:string}} */
+export function statusLabel(status) {
+  return JOB_STATUS[status] || { label: '未知状态', tone: 'wait' };
+}
+
+/** @returns {{label:string, tone:string}} */
+export function stageStatusLabel(status) {
+  return STAGE_STATUS[status] || { label: '等待中', tone: 'wait' };
+}
+
+/** 由阶段 key 推断虚拟员工角色（planner 未提供 role 时的兜底）。 */
+export function roleMeta(stage) {
+  const s = stage || {};
+  const role = s.role || ROLE_BY_STAGE[s.key] || '团队成员';
+  const name = '小' + Array.from(role)[0];
+  return { role, name, initial: Array.from(role)[0] || '员' };
+}
+
+/** 稳定的员工色块配色（按角色固定，不用随机数，避免每次重渲染跳色）。 */
+const ROLE_HUES = {
+  接待员: 210, 项目经理: 258, 调研员: 190,
+  执行专员: 160, 审查员: 28, 质检员: 340, 交付专员: 130,
+};
+export function roleHue(role) {
+  if (ROLE_HUES[role] !== undefined) return ROLE_HUES[role];
+  let h = 0;
+  for (const ch of Array.from(String(role))) h = (h * 31 + ch.codePointAt(0)) % 360;
+  return h;
+}
+
+/**
+ * 耗时格式化。
+ * @param {number|null} ms 已确定的总耗时
+ * @param {number|null} startedAt 进行中的开始时间戳
+ * @param {number} now 当前时间戳（便于测试注入）
+ */
+export function formatElapsed(ms, startedAt, now) {
+  let value = typeof ms === 'number' && Number.isFinite(ms) ? ms : null;
+  if (value === null && typeof startedAt === 'number' && Number.isFinite(startedAt)) {
+    value = Math.max(0, (typeof now === 'number' ? now : startedAt) - startedAt);
+  }
+  if (value === null) return '';
+  if (value < 1000) return (value / 1000).toFixed(1) + ' 秒';
+  if (value < 60000) return (value / 1000).toFixed(1) + ' 秒';
+  const total = Math.round(value / 1000);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  if (m < 60) return m + ' 分 ' + s + ' 秒';
+  const h = Math.floor(m / 60);
+  return h + ' 小时 ' + (m % 60) + ' 分';
+}
+
+/** 相对时间（历史列表用）。 */
+export function formatRelative(ts, now) {
+  if (typeof ts !== 'number' || !Number.isFinite(ts)) return '';
+  const base = typeof now === 'number' ? now : ts;
+  const diff = Math.max(0, base - ts);
+  if (diff < 60000) return '刚刚';
+  if (diff < 3600000) return Math.floor(diff / 60000) + ' 分钟前';
+  if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时前';
+  return Math.floor(diff / 86400000) + ' 天前';
+}
+
+/** 目标摘要：超长截断，避免卡片被撑爆。 */
+export function summarize(text, max) {
+  const limit = typeof max === 'number' ? max : 60;
+  const s = stripControlChars(String(text === null || text === undefined ? '' : text)).replace(/\s+/g, ' ').trim();
+  const chars = Array.from(s);
+  if (chars.length <= limit) return s;
+  return chars.slice(0, limit).join('') + '…';
+}
+
+/** 严重度 / 安全等级 → 中文与色调。 */
+export function severityMeta(severity) {
+  const map = {
+    high: { label: '严重', tone: 'bad' },
+    medium: { label: '中等', tone: 'warn' },
+    low: { label: '轻微', tone: 'info' },
+  };
+  return map[severity] || { label: '提示', tone: 'info' };
+}
+
+export function securityMeta(level) {
+  const map = {
+    clean: { label: '没有发现问题', tone: 'ok', hint: '这次的内容我们检查过了，没有可疑指令，也没有泄露你的隐私信息。' },
+    notice: { label: '有几处提醒', tone: 'warn', hint: '内容里有需要你留意的地方，不影响使用，看一眼下面就好。' },
+    blocked: { label: '已拦截', tone: 'bad', hint: '这次请求里包含了不能执行的内容，我们停下来保护你。' },
+  };
+  return map[level] || { label: '未检查', tone: 'wait', hint: '这次任务还没有做安全检查。' };
+}
+
+export function reviewMeta(verdict) {
+  const map = {
+    pass: { label: '验收通过', tone: 'ok' },
+    pass_with_notes: { label: '通过，但有几条提醒', tone: 'warn' },
+    needs_revision: { label: '需要返工', tone: 'bad' },
+  };
+  return map[verdict] || { label: '尚未验收', tone: 'wait' };
+}
+
+/* ------------------------------ 路由 ------------------------------ */
+
+export const ROUTES = ['home', 'new', 'job', 'history', 'notfound'];
+
+/**
+ * 解析 hash 路由。纯函数，可测。
+ *   '#/'            -> { name:'home',    params:{} }
+ *   '#/new'         -> { name:'new',     params:{} }
+ *   '#/job/job_abc' -> { name:'job',     params:{ id:'job_abc' } }
+ *   '#/history'     -> { name:'history', params:{} }
+ *   其它/空         -> { name:'home' }（首页兜底，绝不白屏）
+ * @param {unknown} hash
+ */
+export function parseRoute(hash) {
+  let raw = typeof hash === 'string' ? hash : '';
+  const qIndex = raw.indexOf('?');
+  let query = '';
+  if (qIndex >= 0) { query = raw.slice(qIndex + 1); raw = raw.slice(0, qIndex); }
+  raw = raw.replace(/^#/, '');
+  const parts = raw.split('/').filter((p) => p.length > 0).map((p) => decodeURIComponent(p));
+
+  let route;
+  if (parts.length === 0) route = { name: 'home', params: {} };
+  else if (parts[0] === 'new') route = { name: 'new', params: {} };
+  else if (parts[0] === 'history') route = { name: 'history', params: {} };
+  else if (parts[0] === 'job' && parts[1]) route = { name: 'job', params: { id: parts[1] } };
+  else route = { name: parts[1] ? 'notfound' : 'home', params: { path: raw } };
+
+  if (query) route.query = Object.fromEntries(new URLSearchParams(query));
+  return route;
+}
+
+/** 生成 hash 链接。 */
+export function routeHash(name, params) {
+  const p = params || {};
+  if (name === 'job' && p.id) return '#/job/' + encodeURIComponent(p.id);
+  if (name === 'new') return '#/new';
+  if (name === 'history') return '#/history';
+  return '#/';
+}
+
+/* ------------------------------ store ------------------------------ */
+
+/**
+ * 极简 store：一个对象 + 订阅。禁止把状态散落成全局变量。
+ * 监听器抛错会被吞掉并计数，绝不让一个坏监听器拖垮整个界面。
+ */
+export function createStore(initialState) {
+  const state = Object.assign({}, initialState);
+  const subs = new Map();
+  let seq = 0;
+
+  return {
+    getState() { return state; },
+    get(key) { return state[key]; },
+    set(patch) {
+      Object.assign(state, patch || {});
+      this.emit();
+    },
+    subscribe(handler) {
+      if (typeof handler !== 'function') return () => {};
+      seq += 1;
+      const id = seq;
+      subs.set(id, handler);
+      return () => { subs.delete(id); };
+    },
+    emit() {
+      const snapshot = Object.assign({}, state);
+      for (const handler of Array.from(subs.values())) {
+        try { handler(snapshot); } catch (err) { /* 单个监听器出错不影响其它 */ }
+      }
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * 4. DOM 渲染（全部在函数体内访问 document，并做 typeof 保护）
+ * ------------------------------------------------------------------ */
+
+function doc() {
+  return typeof document !== 'undefined' ? document : null;
+}
+
+/** 建元素：文本一律走 textContent，属性一律走 setAttribute。 */
+export function el(tag, attrs, children) {
+  const d = doc();
+  if (!d) return null;
+  const node = d.createElement(tag);
+  if (attrs) {
+    for (const key of Object.keys(attrs)) {
+      const value = attrs[key];
+      if (value === null || value === undefined || value === false) continue;
+      if (key === 'text') { node.textContent = String(value); continue; }
+      if (key === 'class') { node.setAttribute('class', String(value)); continue; }
+      if (key === 'html') { node.innerHTML = String(value); continue; } // 调用方保证已转义
+      if (key === 'dataset') {
+        for (const dk of Object.keys(value)) node.dataset[dk] = String(value[dk]);
+        continue;
+      }
+      node.setAttribute(key, value === true ? '' : String(value));
+    }
+  }
+  appendChildren(node, children);
+  return node;
+}
+
+function appendChildren(node, children) {
+  if (children === null || children === undefined || children === false) return;
+  if (Array.isArray(children)) { children.forEach((c) => appendChildren(node, c)); return; }
+  if (typeof children === 'string' || typeof children === 'number') {
+    node.appendChild(node.ownerDocument.createTextNode(String(children)));
+    return;
+  }
+  if (children && typeof children === 'object' && children.nodeType) node.appendChild(children);
+}
+
+export function clear(node) {
+  if (!node) return node;
+  while (node.firstChild) node.removeChild(node.firstChild);
+  return node;
+}
+
+/** 安全地设置文本。 */
+export function setText(node, text) {
+  if (!node) return node;
+  node.textContent = text === null || text === undefined ? '' : String(text);
+  return node;
+}
+
+/**
+ * 渲染已转义的 markdown HTML。
+ * 只接受 renderMarkdown() 的输出（其内部已逐个文本 escapeHtml）。
+ */
+export function setRenderedMarkdown(node, markdownSource) {
+  if (!node) return node;
+  node.innerHTML = renderMarkdown(markdownSource);
+  return node;
+}
+
+/** 状态徽章。 */
+export function statusBadge(status) {
+  const meta = statusLabel(status);
+  return el('span', { class: 'badge tone-' + meta.tone, 'data-status': String(status || '') }, [
+    el('span', { class: 'dot', 'aria-hidden': 'true' }),
+    meta.label,
+  ]);
+}
+
+/** 虚拟员工头像：姓氏首字圆形色块（不用图片，离线可用）。 */
+export function avatarFor(stage) {
+  const meta = roleMeta(stage);
+  const hue = roleHue(meta.role);
+  return el('span', {
+    class: 'avatar',
+    'aria-hidden': 'true',
+    style: '--hue:' + hue,
+  }, meta.initial);
+}
+
+/** 单个虚拟员工（阶段）卡片。 */
+export function stageCard(stage) {
+  const meta = roleMeta(stage);
+  const st = stageStatusLabel(stage.status);
+  const card = el('li', {
+    class: 'stage tone-' + st.tone,
+    'data-stage-id': String(stage.id || ''),
+    'data-status': String(stage.status || 'pending'),
+  }, [
+    el('button', {
+      class: 'stage-head', type: 'button',
+      'aria-expanded': 'false',
+    }, [
+      avatarFor(stage),
+      el('span', { class: 'stage-who' }, [
+        el('span', { class: 'stage-name' }, meta.name + ' · ' + meta.role),
+        el('span', { class: 'stage-title' }, stage.title || STAGE_TITLE_BY_KEY[stage.key] || '工作中'),
+      ]),
+      el('span', { class: 'stage-right' }, [
+        el('span', { class: 'badge tone-' + st.tone, 'data-role': 'status' }, [
+          el('span', { class: 'dot', 'aria-hidden': 'true' }),
+          st.label,
+        ]),
+        el('time', { class: 'elapsed mono', 'data-role': 'elapsed' }, ''),
+        el('span', { class: 'chev', 'aria-hidden': 'true' }, '▾'),
+      ]),
+    ]),
+    stage.reason ? el('p', { class: 'stage-reason' }, stage.reason) : null,
+    el('div', { class: 'stage-log', hidden: true }, [
+      el('div', { class: 'log-head' }, '这一阶段发生了什么'),
+      el('ul', { class: 'log-list', 'data-role': 'log-list', 'aria-live': 'off' }),
+      el('p', { class: 'log-empty', 'data-role': 'log-empty' }, '还没有日志。'),
+    ]),
+  ]);
+  return card;
+}
+
+/** 流程线（首页用来说明"我们不是一次问答"）。 */
+export function pipelineRibbon(keys) {
+  const list = Array.isArray(keys) && keys.length ? keys : Object.keys(STAGE_TITLE_BY_KEY);
+  return el('ol', { class: 'ribbon', 'aria-label': 'AI 团队的八个工作步骤' },
+    list.map((key, index) => el('li', { class: 'ribbon-item' }, [
+      el('span', { class: 'ribbon-num mono' }, String(index + 1)),
+      el('span', { class: 'ribbon-role' }, ROLE_BY_STAGE[key] || '团队成员'),
+      el('span', { class: 'ribbon-title' }, STAGE_TITLE_BY_KEY[key] || key),
+    ])));
+}
+
+/** 骨架屏：首屏加载用，避免"转圈圈然后白屏"。 */
+export function skeleton(kind) {
+  const rows = kind === 'history' ? 3 : kind === 'job' ? 6 : 4;
+  const wrap = el('div', { class: 'skeleton', role: 'status', 'aria-live': 'polite' }, [
+    el('span', { class: 'sr-only' }, '正在加载…'),
+  ]);
+  for (let i = 0; i < rows; i += 1) {
+    wrap.appendChild(el('div', { class: 'sk-row', style: '--i:' + i }, [
+      el('div', { class: 'sk-avatar' }),
+      el('div', { class: 'sk-lines' }, [
+        el('div', { class: 'sk-line w60' }),
+        el('div', { class: 'sk-line w40' }),
+      ]),
+    ]));
+  }
+  return wrap;
+}
+
+/**
+ * 空状态：友善引导 + 直接开始按钮。绝不出现"白页"。
+ * @param {{title:string, body:string, cta?:string, onCta?:Function}} opts
+ */
+export function emptyState(opts) {
+  const o = opts || {};
+  const cta = typeof o.onCta === 'function'
+    ? el('button', { class: 'btn btn-primary', type: 'button' }, o.cta || '开始')
+    : null;
+  if (cta) cta.addEventListener('click', o.onCta);
+  return el('div', { class: 'empty' }, [
+    el('div', { class: 'empty-mark', 'aria-hidden': 'true' }, '⌘'),
+    el('h2', { class: 'empty-title' }, o.title || '这里还是空的'),
+    el('p', { class: 'empty-body' }, o.body || ''),
+    cta,
+  ]);
+}
+
+/**
+ * 失败状态：说清楚「哪一步失败、为什么、你能做什么」。不要只甩报错。
+ */
+export function failureState(opts) {
+  const o = opts || {};
+  const actions = el('div', { class: 'fail-actions' });
+  if (typeof o.onRetry === 'function') {
+    const retry = el('button', { class: 'btn btn-primary', type: 'button' }, '重试这一步');
+    retry.addEventListener('click', o.onRetry);
+    actions.appendChild(retry);
+  }
+  if (typeof o.onNew === 'function') {
+    const fresh = el('button', { class: 'btn', type: 'button' }, '换个说法重开一个任务');
+    fresh.addEventListener('click', o.onNew);
+    actions.appendChild(fresh);
+  }
+  return el('section', { class: 'fail', role: 'alert' }, [
+    el('h2', { class: 'fail-title' }, o.title || '这一步没做成'),
+    el('p', { class: 'fail-where' }, o.where ? '卡住的地方：' + o.where : ''),
+    el('p', { class: 'fail-why' }, o.why || ''),
+    el('p', { class: 'fail-next' }, o.next || '你什么都不用改，直接点下面的按钮再试一次就行。'),
+    actions,
+  ]);
+}
+
+/** 连接中断提示条。 */
+export function connectionBanner(state) {
+  const map = {
+    live: { text: '已连接，进展会实时更新', tone: 'ok' },
+    connecting: { text: '正在连接…', tone: 'wait' },
+    reconnecting: { text: '连接中断，正在重连…', tone: 'warn' },
+    offline: { text: '网络好像断了。检查一下 Wi-Fi，然后点重连。', tone: 'bad' },
+  };
+  const meta = map[state] || map.connecting;
+  const banner = el('div', {
+    class: 'conn tone-' + meta.tone,
+    'data-state': String(state || ''),
+    role: 'status',
+    'aria-live': 'polite',
+  }, [
+    el('span', { class: 'dot', 'aria-hidden': 'true' }),
+    el('span', { 'data-role': 'conn-text' }, meta.text),
+  ]);
+  return banner;
+}
+
+export default {
+  escapeHtml, stripControlChars, safeHref, renderMarkdown,
+  statusLabel, stageStatusLabel, roleMeta, roleHue, formatElapsed, formatRelative,
+  summarize, severityMeta, securityMeta, reviewMeta,
+  parseRoute, routeHash, createStore,
+  el, clear, setText, setRenderedMarkdown, statusBadge, avatarFor, stageCard,
+  pipelineRibbon, skeleton, emptyState, failureState, connectionBanner,
+  ROLE_BY_STAGE, STAGE_TITLE_BY_KEY, ROUTES,
+};

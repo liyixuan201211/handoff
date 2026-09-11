@@ -1,0 +1,15 @@
+{
+  "id": "job-application",
+  "title": "帮我准备求职材料",
+  "emoji": "💼",
+  "category": "工作挣钱",
+  "description": "根据你的经历和目标岗位，写一份说人话的简历和自我介绍。",
+  "placeholders": [
+    { "key": "target", "label": "想应聘什么岗位", "example": "社区医院的护士" },
+    { "key": "background", "label": "你的经历", "example": "护理专业毕业3年，在二甲医院内科待过，会打针输液" },
+    { "key": "highlight", "label": "你最想让人知道的事", "example": "病人满意度一直很高" }
+  ],
+  "goalTemplate": "帮我准备应聘「{{target}}」的材料。我的情况：{{background}}。我最想让人知道的是：{{highlight}}。请帮我写一份简历和一段面试自我介绍。",
+  "tips": "不用写得很好看，把你干过的事用大白话列出来就行，剩下的交给我们。",
+  "sort": 20
+}
