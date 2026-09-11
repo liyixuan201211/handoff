@@ -23,6 +23,37 @@ export const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 export const TEMPLATES_DIR = path.join(ROOT_DIR, 'templates');
 export const VERSION = '1.0.0';
 
+/**
+ * 加载项目根目录的 `.env`。
+ *
+ * 为什么要在代码里做这件事，而不是只靠 `npm start` 的 `--env-file`：
+ * README、`.env.example`、以及"没有 Key"时的报错文案，三处都在教用户"建一个 .env"。
+ * 如果只有 `npm start` 读它，那么用 `node src/server.js`、Docker、systemd、PM2
+ * 启动的用户会得到一份**静默失效**的配置 —— 他改了端口没生效，还以为是产品坏了。
+ * 承诺在哪里说的，就要在哪里兑现。
+ *
+ * 优先级（Node 自己的 `--env-file` 遵循同一套规则）：
+ *   **真实环境变量 > .env 文件里的值**
+ * 所以 `HANDOFF_PORT=9000 node src/server.js` 依然能覆盖 .env 里的端口 ——
+ * "临时改一下"这件事必须做得到。
+ */
+function loadDotEnvFile() {
+  const envPath = path.join(ROOT_DIR, '.env');
+  if (typeof process.loadEnvFile !== 'function') return; // 老 Node 安静跳过
+  const snapshot = { ...process.env }; // ① 记下启动时真实存在的键
+  try {
+    process.loadEnvFile(envPath); // ② .env 全部生效
+  } catch {
+    return; // 文件不存在 / 格式不对都不该阻止服务启动
+  }
+  // ③ 把启动时就存在的键"赢"回来，恢复「真实环境变量优先」
+  for (const [k, v] of Object.entries(snapshot)) {
+    if (v !== undefined) process.env[k] = v;
+  }
+}
+
+loadDotEnvFile();
+
 /** 请求体上限（CONTRACT §5.8） */
 export const BODY_LIMIT = '256kb';
 

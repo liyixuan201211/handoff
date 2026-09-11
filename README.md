@@ -118,8 +118,11 @@ HANDOFF_DEMO=1 npm start
 | `DEEPSEEK_API_KEY` | 自动读取 | DeepSeek 官方 Key |
 | `HANDOFF_MODEL_CHAIN` | 见下 | 模型降级链，逗号分隔，从左到右尝试 |
 | `HANDOFF_DATA_DIR` | `./data` | 任务数据存放目录 |
-| `HANDOFF_DEMO` | `0` | 设为 `1` 进入离线演示模式 |
+| `HANDOFF_DEMO` | `0` | 设为 `1` 进入离线演示模式（整站生效，不用再传 `demo:true`） |
 | `HANDOFF_LLM_TIMEOUT_MS` | `120000` | 单次模型调用超时 |
+
+`.env` 会被自动加载（`npm start` 和 `node src/server.js` 都会读）。
+**真实环境变量优先于 `.env`**，所以 `HANDOFF_PORT=9000 npm start` 是有效的。
 
 默认的模型降级链：
 
@@ -175,8 +178,10 @@ node scripts/dry-run.js     # 真跑一次完整流水线（需要网络 + Key�
 
 - **Node.js + Express，零框架前端。**没有构建步骤，`git clone` 完就能跑。
   对一个人维护的项目来说，少一层构建就少一类故障。
-- **只用 3 个依赖**（express / vitest / supertest）。安全面越小越好，
-  也便于你审计我们到底干了什么。
+- **只有 3 个直接依赖**（express / vitest / supertest），运行期其实只有 express 一个。
+  安全面越小越好，也便于你审计我们到底干了什么。
+  （`npm install` 会拉进约 120 个传递依赖——那是 express 和 vitest 自己的依赖树，
+  不是我们选的。`package.json` 里就那三行。）
 - **数据存本地 JSON 文件。**原子写入，重启不丢，你随时能打开看。
   没有数据库要装，也没有云要连。
 - **不调任何第三方接口**，除了你指定的模型服务商。
