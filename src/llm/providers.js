@@ -33,13 +33,22 @@ export const PROVIDERS = {
   },
 };
 
-/** 默认降级链。左边优先。 */
+/**
+ * 默认降级链。左边优先。
+ *
+ * ⚠️ 长度是刻意控制的（第二轮实测后从 5 级收到 3 级）。
+ * 曾经把 GLM-5.3 和 Qwen3.8-Max 也放在链尾"多一层保险"，
+ * 但实测它们**从来没救回过后面的阶段** —— 前面三家失败通常是因为
+ * 提示词太长（推理模型在长上下文里会超时），换到链尾的模型同样超时，
+ * 只是白白多花掉用户 40~80 秒。
+ *
+ * 「多一个备选」听起来更稳，实际是**把失败成本乘以备选数量**。
+ * 降级链的价值在下游足够能打，不在下游足够多。
+ */
 export const DEFAULT_CHAIN = [
   { provider: 'deepseek-official', model: 'deepseek-flash' },
-  { provider: 'aiping', model: 'DeepSeek-V4-Flash' },
   { provider: 'aiping', model: 'DeepSeek-V4.1-Flash' },
-  { provider: 'aiping', model: 'GLM-5.3' },
-  { provider: 'aiping', model: 'Qwen3.8-Max' },
+  { provider: 'aiping', model: 'DeepSeek-V4-Flash' },
 ];
 
 export function resolveChain(env = process.env) {

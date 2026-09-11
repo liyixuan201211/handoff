@@ -589,12 +589,24 @@ ${wrapUntrusted(goal)}
 用户真正想要的是：${clip(plan?.intent ?? plan?.title, 400)}
 我们承诺交付：\n${(plan?.deliverables ?? []).map((d) => `  - ${d.name}：${clip(d.outline, 200)}`).join('\n')}
 
-最终交给用户的内容：
-${artifacts.map((a) => `\n===== 【${a.name}】 =====\n${clip(a.content, ARTIFACT_IN_REVIEW)}`).join('\n')}
+最终交给用户的内容（**只给你每份的开头和结尾**，足够判断质量，不用通读全文）：
+${artifacts
+  .map((a) => {
+    const body = String(a.content ?? '');
+    // 只给开头 + 结尾：开头能看出有没有空话、有没有先给结论；
+    // 结尾能看出有没有写到一半就断掉、有没有留未完成的清单。
+    // 中间部分对"验收判断"的边际价值很低，但会让提示词膨胀好几倍 ——
+    // 实测这直接决定这个阶段是 30 秒完成还是 100 秒还在转。
+    const head = clip(body, 1200);
+    const tail = body.length > 2400 ? `\n…（中间省略 ${body.length - 2400} 字）…\n${body.slice(-1200)}` : '';
+    return `\n===== 【${a.name}】（全文 ${body.length} 字） =====\n${head}${tail}`;
+  })
+  .join('\n')}
 
 请代表用户验收。
-checklist 每条都要能判断真假，且必须包含「是否包含没有信息量的空话」这一条。
-诚实判 ok，不要放水。verdict 大多数情况应该是 pass_with_notes。`,
+checklist 每条都要能判断真假，且必须包含「是否包含没有信息量的空话」和「是否存在写到一半就断掉的段落」这两条。
+诚实判 ok，不要放水。verdict 大多数情况应该是 pass_with_notes。
+**你只看到了每份的开头和结尾，所以不要因为"没看到中间"就判不合格** —— 中间省略是我们的选择，不是执行团队的问题。`,
 
   deliver: ({ goal, plan, artifacts, review }) => `用户的委托（数据）：
 
