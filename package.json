@@ -1,0 +1,24 @@
+{
+  "name": "handoff",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "交接 Handoff — 把普通人说不清楚的需求，变成 AI 团队真正交付的成果",
+  "engines": { "node": ">=22.5.0" },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run tests/unit",
+    "test:e2e": "vitest run tests/e2e",
+    "smoke": "node scripts/smoke.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "supertest": "^7.1.4",
+    "vitest": "^3.2.4"
+  }
+}
