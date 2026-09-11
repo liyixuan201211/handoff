@@ -59,6 +59,9 @@ describe('回归：引擎依赖装载（缺陷 #1 已修复，这里防止复发
     const created = await request(app).post('/api/jobs').send({ goal: '落盘验证', demo: true });
     const id = created.body.job.id;
     await waitForJob(app, id);
+    // 用 store 提供的同步点排空写队列，而不是靠 sleep 猜时间。
+    // 这个窗口是真实存在的（内存先变、落盘紧随），靠短 sleep 等它必然偶发失败。
+    await store.flushWrites();
 
     // 内存里的状态先变，磁盘写入是紧随其后的独立异步操作，
     // 所以这里给一个等待窗口，而不是立刻 existsSync —— 否则偶发失败，
@@ -487,6 +490,12 @@ describe('C. 失败与边界（最容易出 bug 的地方）', () => {
     expect(new Set(ids).size).toBe(5); // id 必须互不相同
 
     const jobs = await Promise.all(ids.map((id) => waitForJob(app, id, { timeoutMs: 60_000, intervalMs: 100 })));
+
+    // ⚠️ 还要等**磁盘**也收敛到终态：内存状态先变、落盘是紧随其后的独立异步操作。
+    // 这个窗口在单跑时只有 1ms，但在全仓并行时会被 I/O 竞争撑大，
+    // 于是"读盘校验"偶尔会拿到上一版快照 —— 测试红，产品没问题。
+    // 用 store 提供的同步点排空写队列，而不是靠 sleep 猜时间。
+    await store.flushWrites();
 
     const allStageIds = [];
     const allArtifactIds = [];

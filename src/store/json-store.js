@@ -357,6 +357,32 @@ export function stopSyncTimer() {
   syncTimer = null;
 }
 
+/**
+ * 等待所有**已经在排队的**写盘完成。
+ *
+ * 为什么这个函数有存在的必要（不只是给测试用）：
+ * 内存里的 job 状态先变，落盘是紧随其后的独立异步操作。于是存在一个真实窗口：
+ * 「`GET /api/jobs/:id` 已经返回 done」但「磁盘上还是 running」。
+ *  · 测试在这个窗口里读盘 → 偶发失败（我们被它折腾了很久）
+ *  · 进程在这个窗口里被 kill → 用户丢掉最后一次状态更新
+ *  · 关服/重启前如果不排空 → 同上
+ *
+ * 所以它既是测试的同步点，也是优雅关闭该调用的东西。
+ * @returns {Promise<void>}
+ */
+export async function flushWrites() {
+  // chains 里存的是每个 id 的串行队列尾。反复取快照直到不再变化，
+  // 因为等待期间可能又有新的写进来。
+  for (let round = 0; round < 50; round += 1) {
+    const pending = [...chains.values()];
+    if (pending.length === 0) return;
+    await Promise.allSettled(pending);
+    // 队列尾自己会在清空后把自己从表里删掉；再取一次看有没有新的
+    if (chains.size === 0) return;
+    if ([...chains.values()].every((p) => pending.includes(p))) return;
+  }
+}
+
 /** 测试辅助：清空内存与队列（不动磁盘） */
 export function resetStore() {
   cache.clear();
