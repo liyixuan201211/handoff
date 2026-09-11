@@ -5,3 +5,6 @@ data/
 .DS_Store
 coverage/
 tmp/
+
+# vitest 的临时输出
+.vitest/
