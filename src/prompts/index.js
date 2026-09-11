@@ -644,18 +644,25 @@ instruction 字段：把用户的意思整理成一句给执行团队看的明�
  * 唯一例外是 draft/revise：输出正文本身很长，给 24000 留出充足余量。
  */
 export const MAX_TOKENS = {
-  intake: 2000,
-  plan: 4000,
+  // 同下：推理型模型的思考也占 completion 预算。实测 intake 正常要 1500~3100，
+  // 给 2000 太贴边，会给到 6000 留出余量。
+  intake: 6000,
+  plan: 10000,
   // ⚠️ research 要给足：实测 finish_reason=length（被截断）导致该阶段直接失败。
   // 原因是推理型模型会先花掉大量 completion token 在思考上，
   // 而 findings 又要求 1~10 条、每条都可能写到几百字。6000 不够。
   // 给大没有代价：按实际用量计费，没写满的部分不要钱。
   research: 16000,
   draft: 24000,
-  critique: 3500,
+  // ⚠️ 这里是第二轮踩的坑：一开始为了"省时间"把它压到 3500，结果更慢 ——
+  // 推理型模型先花掉大量 completion token 思考，3500 根本不够，
+  // 于是 finish_reason=length（正文为空）→ 重试 → 换模型 → 一个阶段烧掉 200 秒。
+  // **给大没有代价**（按实际用量计费，没写满不要钱），给不够才是灾难。
+  critique: 12000,
   revise: 24000,
-  verify: 4000,
-  deliver: 4000,
+  // 同 critique：推理预算要给足，否则正文被挤空（finish_reason=length）
+  verify: 12000,
+  deliver: 8000,
   amend: 1200,
 };
 
