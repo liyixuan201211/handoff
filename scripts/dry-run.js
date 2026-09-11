@@ -61,7 +61,7 @@ const unsubscribe = events.subscribe(job.id, (e) => {
 });
 
 // 等待结束
-const DEADLINE_MS = 8 * 60 * 1000;
+const DEADLINE_MS = Number(process.env.HANDOFF_DRYRUN_DEADLINE_MS) || 20 * 60 * 1000;
 let final = null;
 while (Date.now() - t0 < DEADLINE_MS) {
   await new Promise((r) => setTimeout(r, 500));
