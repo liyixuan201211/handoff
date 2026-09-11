@@ -643,15 +643,14 @@ describe('C. 失败与边界（最容易出 bug 的地方）', () => {
     const dl = await request(app).get(`/api/jobs/${job.id}/artifacts/${job.artifacts[0].id}/download`);
     expect(dl.text.length).toBeGreaterThan(80); // 正文没被收敛逻辑毁掉
 
-    // 坏消息（缺陷 #11，见 docs/reports/S8-QA.md）：
-    // draft/revise 改成「定界符长文本协议」（schema:null）之后，**结构校验就完全没人做了**；
-    // 模型偶尔仍会输出 JSON，stages.js:171 的「退路一」直接 `jsonAttempt.artifacts` 原样收下，
-    // 不做 schema 校验、也不做语义收敛 —— 于是 "0.95" 进了 artifact，
-    // 违反契约（confidence 只能是 high|medium|low，前端徽章映射表里也没有 "0.95"）。
-    expect(job.artifacts[0].confidence).toBe('0.95');
+    // 缺陷 #11 已修：draft/revise 走「定界符长文本协议」（schema:null）时没有 schema 兜底，
+    // 模型偶尔仍会输出 JSON，退路一会原样收下它的 confidence —— 于是 "0.95" 进了交付物，
+    // 违反契约（confidence 只能是 high|medium|low），前端的把握度徽章也会静默消失。
+    // 现在在 buildArtifacts 里统一归一化（所有路径的必经点）。
+    expect(job.artifacts[0].confidence).toBe('high');
   }, 60_000);
 
-  it.fails('【缺陷 #11】收敛结果应写回调用方：artifact.confidence 应为 high，不是 "0.95"', async () => {
+  it('回归（缺陷 #11 已修复）：收敛结果写回调用方，artifact.confidence 是 high 不是 "0.95"', async () => {
     const realKeys = { aiping: process.env.AIPING_API_KEY, deepseek: process.env.DEEPSEEK_API_KEY };
     process.env.AIPING_API_KEY = 'sk-test-0000000000000000';
     process.env.DEEPSEEK_API_KEY = 'sk-test-0000000000000000';

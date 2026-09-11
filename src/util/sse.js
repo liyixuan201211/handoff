@@ -134,8 +134,35 @@ export function sseHandler({ jobId, req, res, sinceSeq = 0 } = {}) {
   unsubscribe = events.subscribe(jobId, send);
 
   // 一条一条写就好（补发是本地内存数组，量很小）
-  const history = events.since(jobId, cursor).slice(-MAX_REPLAY);
-  for (const event of history) send(event);
+  const history = events.since(jobId, cursor);
+  const replay = history.slice(-MAX_REPLAY);
+
+  // ⚠️ 检测事件断档（对抗性测试 S9-5）。
+  //
+  // 事件日志是环形缓冲，每个 job 最多留 500 条。如果用户断开太久，
+  // 他要的 seq 已经被挤掉了，我们就**静默地少发一段** ——
+  // 前端以为事件是连续的，于是进度条永远停在半路，而且没有任何提示。
+  // 手机锁屏、地铁隧道出来之后就是这个场景。
+  //
+  // 现在：发现接不上就明确告诉客户端"你漏了事件，我重发全量"，
+  // 前端收到 resync 就知道该用权威快照重新对齐，而不是继续等一个不会来的事件。
+  const earliestAvailable = replay.length ? replay[0].seq : null;
+  const hasGap =
+    cursor > 0 && earliestAvailable !== null && earliestAvailable > cursor + 1;
+
+  if (hasGap) {
+    write(
+      `event: resync\ndata: ${safeJson({
+        type: 'resync',
+        reason: 'gap',
+        requestedSince: cursor,
+        earliestAvailable,
+        dropped: earliestAvailable - cursor - 1,
+      })}\n\n`,
+    );
+  }
+
+  for (const event of replay) send(event);
 
   heartbeat = setInterval(() => write(': ping\n\n'), HEARTBEAT_MS);
   // 不要把进程钉住

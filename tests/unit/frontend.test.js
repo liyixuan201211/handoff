@@ -837,3 +837,25 @@ describe('错误消息翻译：每个服务端错误码都要有人话', () => {
     expect(out).toContain('重试');
   });
 });
+
+/* ================================================================== *
+ * SSE 断档与任务删除（服务端修好之后，前端也得接得住）
+ * ================================================================== */
+describe('SSE 协议事件：前端必须处理 resync 与 closed', () => {
+  const src = fs.readFileSync(path.join(process.cwd(), 'public', 'app.js'), 'utf8');
+
+  it('收到 resync 要用权威快照重新对齐（不能继续等一个不会来的事件）', () => {
+    // 背景（对抗性测试 S9-5）：事件日志是环形缓冲，每个 job 最多 500 条。
+    // 用户断开太久时，服务端发现接不上会发 resync。如果前端不处理它，
+    // 界面上的阶段状态会比真实状态少一截，而且没有任何提示 —— 进度条停在半路。
+    expect(src).toContain("evt.type === 'resync'");
+    expect(src).toContain('refreshSnapshot');
+  });
+
+  it('收到 closed 要给出明确去向（任务被删了，不能一直显示"已连接"）', () => {
+    // 背景（对抗性测试 S9-11）：任务被删时服务端会关掉 SSE 连接并发 closed。
+    // 前端不处理的话，用户看到"已连接，进展会实时更新"，但那个任务已经不存在了。
+    expect(src).toContain("evt.type === 'closed'");
+    expect(src).toContain('renderLoadFailure');
+  });
+});

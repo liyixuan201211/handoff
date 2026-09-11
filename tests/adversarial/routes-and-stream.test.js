@@ -195,7 +195,7 @@ describe('攻击：SSE 断线重连的补发', () => {
 
   // 【缺陷 S9-5】客户端要求的 seq 已经被环形缓冲挤掉时，服务端静默少发，
   // 前端也没有"事件断档"检测 —— 用户会看到进度卡在一半，而且没有任何提示
-  it.fails('【缺陷 S9-5】补发不齐时必须告诉客户端"你漏了事件"（或直接发全量快照）', () => {
+  it('回归（缺陷 S9-5 已修复）：补发不齐时必须告诉客户端"你漏了事件"', () => {
     const id = newJobId();
     events.drop(id);
     for (let i = 1; i <= 700; i += 1) events.publish(id, { type: 'log', stageId: 's', text: `#${i}`, at: Date.now() });
@@ -203,8 +203,10 @@ describe('攻击：SSE 断线重连的补发', () => {
     const res = mkRes();
     const cleanup = sseHandler({ jobId: id, req, res });
     const body = res.chunks.join('');
-    // 现状：只发 201..700，没有任何 gap/resync 信号（docs/BUGS.md S9-5）
+    // 修复后：先发一条 resync 事件说明"你漏了 199 条"，再补发剩下的。
+    // 前端收到 resync 就知道该用权威快照重新对齐，而不是继续等一个不会来的事件。
     expect(body).toMatch(/resync|"type":"job"|gap/i);
+    expect(body).toContain('resync');
     cleanup();
     events.drop(id);
   });

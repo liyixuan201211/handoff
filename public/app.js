@@ -762,6 +762,26 @@ class JobView {
     if (!this.isOwner()) return;   // 已经被换掉的视图不再驱动界面
     const job = this.job;
 
+    // 事件断档（服务端发现我们要的 seq 已被环形缓冲挤掉）。
+    // 用户锁屏十分钟、或者地铁隧道出来之后就是这个场景：
+    // 中间那段事件我们永远收不到了，继续等下去进度条会停在半路。
+    // 服务端会紧接着补发剩下的，但我们必须**主动用权威快照重新对齐**，
+    // 否则界面上的阶段状态会比真实状态少一截。
+    if (evt.type === 'resync') {
+      this.resyncing = true;
+      this.refreshSnapshot().finally(() => {
+        this.resyncing = false;
+      });
+      return;
+    }
+
+    // 任务被删掉了 → 服务端主动关了连接，这里给用户一个明确的去向
+    if (evt.type === 'closed') {
+      store.set({ jobStatus: 'error', jobError: '这个任务已经不在了' });
+      this.renderLoadFailure(true, null);
+      return;
+    }
+
     if (evt.type === 'log') {
       this.enqueueLog(evt);
       return;

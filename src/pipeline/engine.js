@@ -19,6 +19,7 @@ import { callModel as realCallModel } from '../llm/gateway.js';
 import { AppError, ERR, redactSecrets } from '../llm/errors.js';
 import { events, newId } from '../store/events.js';
 import { isDemoMode } from '../runtime-flags.js';
+import { mapConfidence } from '../llm/schema-check.js';
 
 /**
  * 交付物"够不够像样"的判定阈值。
@@ -887,6 +888,24 @@ function compactOutput(output) {
   return clone;
 }
 
+/**
+ * 把任意写法的"把握程度"收敛成契约允许的三个值。
+ *
+ * 契约（docs/CONTRACT.md §2）只允许 high | medium | low。
+ * 长文本协议下没有 schema 兜底，所以这里必须自己收。
+ * @param {unknown} value 模型给的值（可能是 "0.95" / 95 / "HIGH" / "严重" / undefined）
+ * @returns {'high'|'medium'|'low'}
+ */
+function normalizeConfidence(value) {
+  if (value === undefined || value === null || value === '') return 'medium';
+  if (typeof value === 'string') {
+    const s = value.trim().toLowerCase();
+    if (s === 'high' || s === 'medium' || s === 'low') return s;
+  }
+  // mapConfidence 能处理 "0.95" / 95 / "严重" 这类（返回 null 表示完全没头绪）
+  return mapConfidence(value) ?? 'medium';
+}
+
 /* ────────────────────────────────────────────────────────────────
  * 产物构建
  * ──────────────────────────────────────────────────────────────── */
@@ -933,7 +952,12 @@ export function buildArtifacts(job, rawArtifacts, previous = []) {
       format: 'markdown',
       content,
       assumptions: raw?.assumptions ?? prev?.assumptions ?? [],
-      confidence: raw?.confidence ?? prev?.confidence ?? 'medium',
+      // ⚠️ confidence 必须在这里归一化（缺陷 #11）。
+      // draft/revise 走的是"定界符长文本协议"（schema:null），**结构校验没人做**；
+      // 模型偶尔仍会输出 JSON，退路一会原样收下它的 confidence —— 于是 "0.95"
+      // 就进了交付物、违反契约，前端的把握度徽章映射表里也没有这个值，会静默消失。
+      // 这里用 mapConfidence 把 0.95→high、95→high、中文"严重"之类都收敛掉。
+      confidence: normalizeConfidence(raw?.confidence ?? prev?.confidence),
       basedOn: (job.stages ?? []).filter((s) => s.status === 'done').map((s) => s.id),
       createdAt: Date.now(),
     });
