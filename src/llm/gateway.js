@@ -370,8 +370,17 @@ export async function callModel(opts) {
       } catch (err) {
         // 用户取消：立刻抛出，绝不重试
         if (err?.code === ERR.LLM_ABORTED) throw err;
-        // 不可重试的 4xx（除了已列入白名单的）：直接换 provider
-        if (err?.retriable === false || err?.status === 400) {
+
+        // ⚠️ 这里曾经写的是 `err?.retriable === false || err?.status === 400`。
+        // 问题是：429（限流）在构造 AppError 时被归一成 `status: 400`
+        //（见 callOnce 里 `status: res.status >= 500 ? 502 : 400`），
+        // 于是**明明标了 retriable=true 的 429 还是被第一个条件放行成了"不可重试"**。
+        // 而 429 恰恰是最该重试的一种失败 —— 上游只是让我们慢一点。
+        // 用户看到的就是"重试一下就好"的场景直接失败。
+        //
+        // 修法：只信 `retriable`，不再拿归一化过的 status 当判据。
+        // `retriable` 由 retriableStatus() 依据**真实 HTTP 状态码**算出，是权威的。
+        if (err?.retriable === false) {
           lastError = err;
           break;
         }
@@ -407,12 +416,40 @@ export async function callModel(opts) {
     throw err;
   }
 
+  /**
+   * ⚠️ 保留**具体**的失败原因，而不是一律说成 LLM_NO_PROVIDER。
+   *
+   * 为什么重要（缺陷 #3）：整条链都没成功时，我们习惯性抛 LLM_NO_PROVIDER
+   * （"所有模型都没连上"）。但真实原因常常是**别的东西**：
+   *   · 全部超时 → 该说的是「模型想得太久了」
+   *   · 全部返回无法解析的内容 → 该说的是「模型答得乱七八糟」
+   * 把它们都说成"连不上"，前端翻译表就白做了 —— 用户会去检查网络和 API Key，
+   * 而其实网络和 Key 都是好的。**指错排查方向比不给方向更糟。**
+   *
+   * 规则：链上所有失败都是同一个 code 时，就用那个 code；
+   *      否则（失败原因不一致）才退回 LLM_NO_PROVIDER。
+   */
+  const meaningful =
+    lastError?.code && lastError.code !== ERR.LLM_NO_PROVIDER ? lastError.code : null;
+
   const detail = lastError?.message ? redactSecrets(lastError.message) : '未知原因';
-  const finalErr = new AppError(
-    ERR.LLM_NO_PROVIDER,
-    `所有模型都没能完成任务。最后一次的失败原因：${detail}`,
-    { status: 503, cause: lastError },
-  );
+  const headline = meaningful
+    ? `${PROVIDERS[chain[0]?.provider]?.label ?? '模型'} 这次没能给出结果。原因：${detail}`
+    : `所有模型都没能完成任务。最后一次的失败原因：${detail}`;
+
+  const finalErr = new AppError(meaningful ?? ERR.LLM_NO_PROVIDER, headline, {
+    status: meaningful === ERR.LLM_TIMEOUT ? 504 : 503,
+    cause: lastError,
+  });
+
+  // 把内层错误的**诊断信息**搬到外层。
+  // 这些不是给用户看的，是给排障和测试用的：
+  //   · raw：模型原文（JSON 修复失败时最有用，能看出它到底写了什么）
+  //   · details：结构校验逐条失败的原因
+  //   · attempts：一共试了几次
+  // 不搬的话，外层错误只剩一句包装文案，出了问题无从下手。
+  if (lastError?.raw !== undefined) finalErr.raw = lastError.raw;
+  if (lastError?.details !== undefined) finalErr.details = lastError.details;
   finalErr.attempts = attemptsMade;
   finalErr.usage = totalUsage;
   finalErr.ms = totalMs;

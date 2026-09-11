@@ -328,7 +328,10 @@ describe('callModel — 降级链与密钥安全', () => {
     }
 
     expect(caught).not.toBeNull();
-    expect(caught.code).toBe(ERR.LLM_NO_PROVIDER);
+    // 缺陷 #3 修复后，链上最后一次失败的原因会被**保留**下来
+    // （这里全是 HTTP 错误，所以是 LLM_HTTP_ERROR），而不是一律说成 LLM_NO_PROVIDER。
+    // 这条用例真正要守的是**密钥不泄漏**，所以这里断言"是已知的错误码之一"。
+    expect([ERR.LLM_HTTP_ERROR, ERR.LLM_NO_PROVIDER]).toContain(caught.code);
     // 整条错误链（message + cause + stack）都不许出现密钥
     const dump = errorDump(caught);
     expect(dump).not.toContain(TEST_KEY);
@@ -474,36 +477,53 @@ describe('backoffMs', () => {
  * 它们现在「红」，用 it.fails 表达：一旦有人把缺陷修好，这些用例会失败，
  * 那就是提醒你改成 it(...) 正断言。
  * ================================================================== */
-describe('已知契约差异 #2：429（限流）应当重试，实际被当成硬 400 直接放弃', () => {
-  it('现状记录：单 provider 链遇到 429 → 只请求 1 次就失败', async () => {
-    const mock = makeFetch([errorResponse(429, 'rate limited'), jsonResponse(completionBody('{"title":"ok"}'))]);
-    const sleep = makeSleep();
-    let caught = null;
-    try {
-      await callModel(base({ schema: TITLE_SCHEMA, deps: { fetch: mock.fetch, chain: ONE_STEP_CHAIN, resolveKey: () => ({ key: TEST_KEY, source: 'explicit' }), env: {}, sleep } }));
-    } catch (e) {
-      caught = e;
-    }
-    expect(caught).not.toBeNull();
-    expect(mock.count()).toBe(1);
-    expect(sleep.waits.length).toBe(0);
-  });
-
-  it.fails('【缺陷 #2】429 → 退避后重试并成功（CONTRACT §4：网络/5xx/429 指数退避重试 2 次）', async () => {
+describe('回归（缺陷 #2 已修复）：429 限流必须退避重试', () => {
+  // 这个缺陷的根因值得记住：429 在构造 AppError 时被**归一化成 status: 400**
+  //（`status: res.status >= 500 ? 502 : 400`），而重试判定里有一句
+  // `err?.status === 400` → 于是明明标了 retriable=true 的 429 被当成硬 400 直接放弃。
+  // 而 429 恰恰是最该重试的一种失败：上游只是让我们慢一点。
+  // 用户感受到的是「重试一下就好」的场景直接失败。
+  //
+  // 修法：只信 `retriable`（它由真实 HTTP 状态码算出），不再拿归一化过的 status 当判据。
+  it('429 → 退避后重试并成功，且不算降级', async () => {
     const mock = makeFetch([errorResponse(429, 'rate limited'), jsonResponse(completionBody('{"title":"退避后成功"}'))]);
     const sleep = makeSleep();
     const r = await callModel(
       base({ schema: TITLE_SCHEMA, deps: { fetch: mock.fetch, chain: ONE_STEP_CHAIN, resolveKey: () => ({ key: TEST_KEY, source: 'explicit' }), env: {}, sleep } }),
     );
     expect(mock.count()).toBe(2);
-    expect(sleep.waits.length).toBe(1);
+    expect(sleep.waits.length).toBe(1); // 确实退避了一次
+    expect(sleep.waits[0]).toBeGreaterThan(0);
     expect(r.json).toEqual({ title: '退避后成功' });
-    expect(r.degraded).toBe(false);
+    expect(r.degraded).toBe(false); // 还在同一个 provider 上，不算降级
+  });
+
+  it('429 一直持续 → 重试用尽后才失败（不能无限重试）', async () => {
+    const mock = makeFetch([errorResponse(429, 'rate limited')]); // 永远是 429
+    const sleep = makeSleep();
+    await expect(
+      callModel(base({ schema: TITLE_SCHEMA, deps: { fetch: mock.fetch, chain: ONE_STEP_CHAIN, resolveKey: () => ({ key: TEST_KEY, source: 'explicit' }), env: {}, sleep } })),
+    ).rejects.toThrow();
+    expect(mock.count()).toBe(2); // 首试 + 1 次重试，有上限
+  });
+
+  it('真正的 400（参数错）依然不重试 —— 修 429 不能顺手把 400 也变成重试', async () => {
+    const mock = makeFetch([errorResponse(400, 'bad request')]);
+    const sleep = makeSleep();
+    await expect(
+      callModel(base({ schema: TITLE_SCHEMA, deps: { fetch: mock.fetch, chain: ONE_STEP_CHAIN, resolveKey: () => ({ key: TEST_KEY, source: 'explicit' }), env: {}, sleep } })),
+    ).rejects.toThrow();
+    expect(mock.count()).toBe(1); // 一次都不重试
+    expect(sleep.waits.length).toBe(0);
   });
 });
 
-describe('已知契约差异 #3：具体错误码全部退化为 LLM_NO_PROVIDER', () => {
-  it('现状记录：超时 / JSON 非法 / 结构非法 的 code 都是 LLM_NO_PROVIDER', async () => {
+describe('回归（缺陷 #3 已修复）：具体失败原因必须保留，不能一律说成"连不上"', () => {
+  // 根因：整条链都没成功时一律抛 LLM_NO_PROVIDER。但真实原因常常是别的东西 ——
+  // 全部超时、全部返回无法解析的内容。把它们都说成"所有模型都没连上"，
+  // 用户就会去检查网络和 API Key，而其实那两样都是好的。
+  // **指错排查方向比不给方向更糟。**
+  it('修复后：超时 → LLM_TIMEOUT；JSON 非法 → LLM_JSON_INVALID；结构非法 → LLM_SCHEMA_INVALID', async () => {
     const cases = [];
 
     // 超时
@@ -525,10 +545,10 @@ describe('已知契约差异 #3：具体错误码全部退化为 LLM_NO_PROVIDER
       cases.push(e.code);
     }
 
-    expect(cases).toEqual([ERR.LLM_NO_PROVIDER, ERR.LLM_NO_PROVIDER, ERR.LLM_NO_PROVIDER]);
+    expect(cases).toEqual([ERR.LLM_TIMEOUT, ERR.LLM_JSON_INVALID, ERR.LLM_SCHEMA_INVALID]);
   });
 
-  it.fails('【缺陷 #3】超时 → 抛 LLM_TIMEOUT（而不是 LLM_NO_PROVIDER）', async () => {
+  it('超时 → 抛 LLM_TIMEOUT（而不是 LLM_NO_PROVIDER）', async () => {
     let caught = null;
     try {
       await callModel(base({ schema: null, timeoutMs: 30, deps: { fetch: hangingFetch(), chain: ONE_STEP_CHAIN, resolveKey: () => ({ key: TEST_KEY, source: 'explicit' }), env: {}, sleep: makeSleep() } }));
@@ -538,7 +558,7 @@ describe('已知契约差异 #3：具体错误码全部退化为 LLM_NO_PROVIDER
     expect(caught.code).toBe(ERR.LLM_TIMEOUT);
   });
 
-  it.fails('【缺陷 #3】返回非 JSON 文本 → 抛 LLM_JSON_INVALID（而不是 LLM_NO_PROVIDER）', async () => {
+  it('返回非 JSON 文本 → 抛 LLM_JSON_INVALID（而不是 LLM_NO_PROVIDER）', async () => {
     const mock = makeFetch([jsonResponse(completionBody('这不是 JSON，只是一段话。'))]);
     let caught = null;
     try {
@@ -550,7 +570,7 @@ describe('已知契约差异 #3：具体错误码全部退化为 LLM_NO_PROVIDER
     expect(caught.raw).toContain('这不是 JSON'); // 契约要求把原文（截断 2000 字）放进错误里
   });
 
-  it.fails('【缺陷 #3】结构连续不合法 → 抛 LLM_SCHEMA_INVALID（而不是 LLM_NO_PROVIDER）', async () => {
+  it('结构连续不合法 → 抛 LLM_SCHEMA_INVALID（而不是 LLM_NO_PROVIDER）', async () => {
     const mock = makeFetch([jsonResponse(completionBody('{"nope":1}'))]);
     let caught = null;
     try {
