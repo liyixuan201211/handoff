@@ -9,6 +9,7 @@ import {
   TEAM,
   SCHEMAS,
   MAX_TOKENS,
+  STAGE_TIMEOUT_MS,
   systemPromptFor,
   buildUser,
 } from '../prompts/index.js';
@@ -132,6 +133,7 @@ const extraRequirements = (userMessages = []) => {
  * 兜底：万一模型还是输出了 JSON（它有时很固执），这里也认。
  */
 async function callForArtifacts(ctx, { system, user, maxTokens, purpose, role, temperature }) {
+  const stageTimeout = timeoutFor(purpose);
   const runOnce = (extra = '') =>
     ctx.callModel({
       system: `${system}\n\n${ARTIFACT_PROTOCOL_SPEC}${extra}`,
@@ -141,6 +143,7 @@ async function callForArtifacts(ctx, { system, user, maxTokens, purpose, role, t
       purpose,
       role,
       temperature,
+      timeoutMs: stageTimeout,
     });
 
   let res = await runOnce();
@@ -242,9 +245,16 @@ function extractJsonObject(text) {
   }
 }
 
+/**
+ * 给某个阶段算超时。取该阶段配置，没配就用 120 秒兜底。
+ * @param {string} key 阶段 key
+ */
+const timeoutFor = (key) => STAGE_TIMEOUT_MS[key] ?? 120000;
+
 export const STAGE_RUNNERS = {
   async intake(ctx) {
     const out = await ctx.callModel({
+      timeoutMs: timeoutFor('intake'),
       system: systemPromptFor('intake'),
       user: buildUser.intake({
         goal: ctx.goal,
@@ -266,6 +276,7 @@ export const STAGE_RUNNERS = {
 
   async plan(ctx) {
     const out = await ctx.callModel({
+      timeoutMs: timeoutFor('plan'),
       system: systemPromptFor('plan'),
       user:
         buildUser.plan({ goal: ctx.goal, intake: ctx.outputs.intake }) +
@@ -282,6 +293,7 @@ export const STAGE_RUNNERS = {
 
   async research(ctx) {
     const out = await ctx.callModel({
+      timeoutMs: timeoutFor('research'),
       system: systemPromptFor('research'),
       user: buildUser.research({ goal: ctx.goal, plan: ctx.plan }),
       schema: SCHEMAS.research,
@@ -314,6 +326,7 @@ export const STAGE_RUNNERS = {
 
   async critique(ctx) {
     const res = await ctx.callModel({
+      timeoutMs: timeoutFor('critique'),
       system: `${systemPromptFor('critique')}\n\n${CRITIQUE_PROTOCOL_SPEC}`,
       user: buildUser.critique({ goal: ctx.goal, plan: ctx.plan, artifacts: ctx.artifacts }),
       schema: null,
@@ -365,6 +378,7 @@ export const STAGE_RUNNERS = {
 
   async verify(ctx) {
     const out = await ctx.callModel({
+      timeoutMs: timeoutFor('verify'),
       system: systemPromptFor('verify'),
       user: buildUser.verify({
         goal: ctx.goal,
@@ -384,6 +398,7 @@ export const STAGE_RUNNERS = {
 
   async deliver(ctx) {
     const out = await ctx.callModel({
+      timeoutMs: timeoutFor('deliver'),
       system: systemPromptFor('deliver'),
       user: buildUser.deliver({
         goal: ctx.goal,

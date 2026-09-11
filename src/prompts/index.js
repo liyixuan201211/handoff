@@ -448,6 +448,29 @@ export function systemPromptFor(key, opts = {}) {
  * 每个阶段的 user 提示词构造器
  * ──────────────────────────────────────────────────────────────── */
 
+/**
+ * 送进「审查 / 改稿 / 验收」这几个阶段的**每份交付物**最多带多少字。
+ *
+ * ⚠️ 这个数字直接影响成功率和耗时，别随手调大。
+ * 实测教训：原来是 6000，而一份交付物常常就有 6000~10000 字，2~3 份叠加后
+ * 单次请求的输入就到了两三万字。模型（尤其备用模型）在这种长上下文里
+ * 常常 120 秒还出不来结果 → 超时 → 重试 → 换模型 → 一个阶段烧掉 200~300 秒，
+ * 整个任务跑 8 分钟还没结束（真实干跑记录在 docs/reports/ 里）。
+ *
+ * 截到 1500 字仍然足够做质量判断：审查员要找的是**空话、编造、半截、自相矛盾**，
+ * 这些特征在开头 1500 字里就能看出来。真正的长文格式问题由质检员的
+ * 「是否写到一半就断掉」这一条兜底。
+ *
+ * 为什么从 3000 又降到 1500（第二轮实测）：
+ * 真实交付物常有 6000~10000 字，两份一起送进去就是近万字的提示词。
+ * 在这种长度下，**推理型模型会把 max_tokens 全花在思考上**（我们只能从
+ * completion_tokens 里看到它花了，但 content 是空的），于是报"没返回正文"、
+ * 重试、换模型 —— 一个审查阶段烧掉 200 多秒还没结束。
+ * 用 3150 字的提示词逐家测过：三个 provider 都是 25~28 秒正常返回。
+ * 所以把输入压到那个量级是**有实测依据**的，不是保守。
+ */
+const ARTIFACT_IN_REVIEW = 1500;
+
 const clip = (s, n) => {
   const str = String(s ?? '');
   return str.length <= n ? str : `${str.slice(0, n)}…（已截断）`;
@@ -536,7 +559,7 @@ ${renderPlan(plan)}
 
 执行专员做出来的内容：
 ${artifacts
-  .map((a) => `\n===== 【${a.name}】=====\n${clip(a.content, 6000)}`)
+  .map((a) => `\n===== 【${a.name}】=====\n${clip(a.content, ARTIFACT_IN_REVIEW)}`)
   .join('\n')}
 
 请狠狠地挑毛病。重点：有没有空话？有没有编造？普通人能不能真的照着做？漏了什么？
@@ -549,7 +572,7 @@ ${wrapUntrusted(goal)}
 ${renderPlan(plan)}
 
 你上一版的稿子：
-${artifacts.map((a) => `\n===== 【${a.name}】 =====\n${clip(a.content, 6000)}`).join('\n')}
+${artifacts.map((a) => `\n===== 【${a.name}】 =====\n${clip(a.content, ARTIFACT_IN_REVIEW)}`).join('\n')}
 
 审查员挑出的问题：
 ${issues
@@ -567,7 +590,7 @@ ${wrapUntrusted(goal)}
 我们承诺交付：\n${(plan?.deliverables ?? []).map((d) => `  - ${d.name}：${clip(d.outline, 200)}`).join('\n')}
 
 最终交给用户的内容：
-${artifacts.map((a) => `\n===== 【${a.name}】 =====\n${clip(a.content, 6000)}`).join('\n')}
+${artifacts.map((a) => `\n===== 【${a.name}】 =====\n${clip(a.content, ARTIFACT_IN_REVIEW)}`).join('\n')}
 
 请代表用户验收。
 checklist 每条都要能判断真假，且必须包含「是否包含没有信息量的空话」这一条。
@@ -613,9 +636,32 @@ export const MAX_TOKENS = {
   plan: 4000,
   research: 6000,
   draft: 24000,
-  critique: 6000,
+  critique: 3500,
   revise: 24000,
-  verify: 6000,
+  verify: 4000,
   deliver: 4000,
   amend: 1200,
+};
+
+/**
+ * 每个阶段的**单次调用超时**（毫秒）。
+ *
+ * 为什么要分阶段给：统一 120 秒对长文阶段（draft/revise）是合理的，
+ * 但对 intake/verify 这种"输入输出都不算大"的阶段太宽松了 ——
+ * 撞上慢的时候，120 秒 × 2 次重试 × 多个模型 = 用户等十分钟。
+ * 给紧一点的超时，让它在确认真拿不到结果时**早点失败、早点换模型**。
+ *
+ * 实测依据：正常一次 intake 只要 8~10 秒，verify 30~60 秒。
+ * 40 秒还没出来，基本就是这家 provider 此刻不行。
+ */
+export const STAGE_TIMEOUT_MS = {
+  intake: 45000,
+  plan: 60000,
+  research: 75000,
+  draft: 150000,
+  critique: 90000,
+  revise: 150000,
+  verify: 75000,
+  deliver: 45000,
+  amend: 30000,
 };

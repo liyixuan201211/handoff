@@ -709,6 +709,27 @@ async function runOneStage({
   const runner = STAGE_RUNNERS[key];
   if (!runner) throw new AppError(ERR.PIPELINE_STAGE_FAILED, `未知阶段：${key}`, { status: 500 });
 
+  // ── 单阶段硬上限 ──────────────────────────────────────────────
+  //
+  // 为什么需要它（第二轮实测暴露的）：
+  // 网关内部有「单次调用超时 × 重试 × 降级链」的层层放大。
+  // 重试次数和链长都已经收紧过，但**乘起来仍然可能很大** ——
+  // 实测出现过一个审查阶段跑 200 秒还没结束、整个任务 8 分钟不收敛的情况。
+  // 对用户来说，"等了 8 分钟还在转"和"失败"一样糟：他早就关掉了。
+  //
+  // 所以在这里设一个**阶段总墙钟上限**：到点就中止这个阶段的剩余尝试，
+  // 让它明确失败（而不是无限拖）。失败时前面已完成的产物一律保留 ——
+  // 用户至少能拿到东西，而不是对着一个永远转的圈。
+  const STAGE_WALL_MS = 300_000;
+  const stageAbort = new AbortController();
+  const abortRelay = () => stageAbort.abort();
+  if (signal) {
+    if (signal.aborted) abortRelay();
+    else signal.addEventListener('abort', abortRelay, { once: true });
+  }
+  const wallTimer = setTimeout(() => stageAbort.abort(), STAGE_WALL_MS);
+  wallTimer.unref?.();
+
   stage.status = 'running';
   stage.startedAt = Date.now();
   stage.endedAt = null;
@@ -743,9 +764,11 @@ async function runOneStage({
       log,
       emit,
       checkAbort,
-      signal,
+      signal: stageAbort.signal,
     });
 
+    clearTimeout(wallTimer);
+    signal?.removeEventListener?.('abort', abortRelay);
     stage.status = 'done';
     stage.endedAt = Date.now();
     stage.ms = stage.endedAt - stage.startedAt;
@@ -763,18 +786,31 @@ async function runOneStage({
     });
     return output;
   } catch (err) {
-    if (err?.code === ERR.LLM_ABORTED || err?.code === ERR.PIPELINE_CANCELLED) {
+    clearTimeout(wallTimer);
+    signal?.removeEventListener?.('abort', abortRelay);
+
+    // 阶段墙钟超时：给一个用户能看懂的说法，别把内部的 AbortError 抛出去
+    const wallHit = !signal?.aborted && stageAbort.signal.aborted;
+    const normalized = wallHit
+      ? new AppError(
+          ERR.LLM_TIMEOUT,
+          `这一步花了超过 ${Math.round(STAGE_WALL_MS / 1000)} 秒还没做完，我们先停下来了（免得你一直等）。前面已经做好的东西都留着。`,
+          { status: 504, cause: err },
+        )
+      : err;
+
+    if (normalized?.code === ERR.LLM_ABORTED || normalized?.code === ERR.PIPELINE_CANCELLED) {
       stage.status = 'pending';
       stage.endedAt = Date.now();
       await save(job);
-      throw err;
+      throw normalized;
     }
     stage.status = 'failed';
     stage.endedAt = Date.now();
     stage.ms = stage.endedAt - stage.startedAt;
     stage.error = {
-      code: err?.code ?? 'INTERNAL_ERROR',
-      message: redactSecrets(err?.message ?? '这一步没能完成'),
+      code: normalized?.code ?? 'INTERNAL_ERROR',
+      message: redactSecrets(normalized?.message ?? '这一步没能完成'),
     };
     log(stage.error.message, 'error');
     job.updatedAt = Date.now();
@@ -787,7 +823,7 @@ async function runOneStage({
       role: stage.role,
       ms: stage.ms,
     });
-    throw err;
+    throw normalized;
   }
 }
 
