@@ -6,7 +6,13 @@
  * 所以这里只等 startJob() 把 job 建起来（拿到 id），立刻 201 返回，剩下的走 SSE 推。
  */
 import express from 'express';
-import { startJob, sendMessage, retryJob, cancelJob } from '../pipeline/engine.js';
+import * as engine from '../pipeline/engine.js';
+
+// 注意：这里必须用 namespace 导入 + 运行时判空，不能写成
+// `import { gradeDelivery } from '../pipeline/engine.js'`。
+// 因为测试会 `vi.mock()` 整个 engine 模块，具名导入会变成 undefined 并在调用处崩，
+// 而 namespace 导入能让这些函数**在模块被替换时优雅退化**（工程上比"崩"好得多）。
+const { startJob, sendMessage, retryJob, cancelJob } = engine;
 import { AppError, ERR, toPublicError } from '../llm/errors.js';
 import * as store from '../store/json-store.js';
 import { events } from '../store/events.js';
@@ -199,13 +205,38 @@ function artifactFull(a) {
   };
 }
 
-/** 全量 job（交付物带正文，前端拿到即可直接渲染） */
+/**
+ * 全量 job（交付物带正文，前端拿到即可直接渲染）。
+ *
+ * `grade` = 交付质量的一句话结论（engine.gradeDelivery 生成）。
+ * 必须放在**详情接口**里，不能只在 SSE 事件里：用户刷新页面后走的是 GET，
+ * 如果没有 grade，界面就不知道该怎么提示"质检提了几条意见"。
+ */
 export function publicJob(job) {
   if (!job || typeof job !== 'object') return null;
   return {
     ...job,
+    grade: safeGrade(job),
     artifacts: Array.isArray(job.artifacts) ? job.artifacts.map(artifactFull) : [],
   };
+}
+
+/**
+ * 安全地取交付质量分级。
+ *
+ * 为什么要 try/catch 而不是 `typeof engine.gradeDelivery === 'function'`：
+ * vitest 的 `vi.mock()` 会给模块套一层 Proxy，**读取一个 mock 里没定义的属性就会抛错**，
+ * 于是 `typeof` 判断本身就把整个请求打成 500。所以这里必须真的 catch。
+ * （这个坑很隐蔽：单测全绿、e2e 全绿，只有"有人 mock 了这个模块"时才炸。）
+ */
+function safeGrade(job) {
+  if (!job || job.status !== 'done') return null;
+  try {
+    const fn = engine.gradeDelivery;
+    return typeof fn === 'function' ? fn(job) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** 列表页用的轻量摘要（不带正文，避免 50 条任务的响应过大） */
