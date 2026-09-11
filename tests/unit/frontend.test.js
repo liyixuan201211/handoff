@@ -474,11 +474,33 @@ describe('api 客户端', () => {
     expect(res3.templates[0].title).toBe('真模板');
   });
 
-  it('listJobs 同时兼容数组和 { jobs: [] } 两种返回', async () => {
+  it('listJobs 一律返回**裸数组**（后端包了 { jobs } 也要拆掉）', async () => {
+    // 2026-09-12 变更：以前这里返回服务端原始形状（可能是 { jobs: [...] }），
+    // 由 app.js 自己判断；现在统一在 api.js 里拆包，调用方拿到的永远是数组。
+    // 理由见 api.js 里 unwrapJob 的注释 —— 服务端包 { job }/前端按扁平读，
+    // 这个不一致曾经让整个产品在真实浏览器里点不通，而两侧单测都是绿的。
     const a = createApi({ fetchImpl: mockFetch({ 'GET /api/jobs': [{ id: 'j1' }] }) });
+    expect(Array.isArray(await a.listJobs())).toBe(true);
     expect((await a.listJobs())[0].id).toBe('j1');
+
     const b = createApi({ fetchImpl: mockFetch({ 'GET /api/jobs': { jobs: [{ id: 'j2' }] } }) });
-    expect((await b.listJobs()).jobs[0].id).toBe('j2');
+    const bResult = await b.listJobs();
+    expect(Array.isArray(bResult)).toBe(true);
+    expect(bResult[0].id).toBe('j2');
+  });
+
+  it('createJob / getJob / sendMessage / retryJob 都要拆掉 { job } 包装', async () => {
+    const fetchImpl = mockFetch({
+      'POST /api/jobs': { job: { id: 'job_x', status: 'queued' } },
+      'GET /api/jobs/job_x': { job: { id: 'job_x', status: 'done' } },
+      'POST /api/jobs/job_x/message': { job: { id: 'job_x', status: 'running' } },
+      'POST /api/jobs/job_x/retry': { job: { id: 'job_x', status: 'queued' } },
+    });
+    const api = createApi({ fetchImpl });
+    expect((await api.createJob({ goal: 'x' })).id).toBe('job_x');
+    expect((await api.getJob('job_x')).status).toBe('done');
+    expect((await api.sendMessage('job_x', 'y')).id).toBe('job_x');
+    expect((await api.retryJob('job_x')).status).toBe('queued');
   });
 
   it('retryJob / sendMessage / deleteJob 打到正确端点', async () => {

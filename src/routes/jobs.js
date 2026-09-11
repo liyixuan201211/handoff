@@ -45,6 +45,14 @@ export function stripControlChars(input) {
 
 export function requireGoal(raw) {
   if (raw === undefined || raw === null) throw bad('请说一下你需要什么帮助。');
+  // ⚠️ 类型必须先判，而且必须在 route 这一层就判。
+  // 只靠 engine 里判是没用的：这里会把任何东西 `String()` 成
+  // "12345" / "true" / "[object Object]" 再传下去，engine 看到的已经是合法字符串了。
+  // 结果用户的任务目标变成「[object Object]」，界面和模型都拿到一段乱码。
+  // （这条是对抗性测试 S9-9：契约 §2 说 goal 是字符串，那就按契约拒掉。）
+  if (typeof raw !== 'string') {
+    throw bad('请用一段文字描述你要办的事。');
+  }
   const goal = stripControlChars(raw).trim();
   if (goal.length < LIMITS.GOAL_MIN) throw bad('请说一下你需要什么帮助。');
   if (goal.length > LIMITS.GOAL_MAX) {

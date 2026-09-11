@@ -106,45 +106,79 @@ export function createApi(options) {
     return body;
   }
 
+  /**
+   * 把服务端的包装拆掉。
+   *
+   * ⚠️ 这是本项目代价最大的一个 bug，务必理解它为什么能藏这么久：
+   * 服务端所有任务接口返回 `{ job: {...} }`（CONTRACT §2），
+   * 而前端按**扁平对象**读（`job.id` / `job.status` / `job.artifacts`）。
+   * 结果是一条**中间那根线**上的契约不一致：
+   *   · 前端的单测只测 api.js 这一层 → 绿
+   *   · 后端的 e2e 全部 `request(app)` 直打服务端，绕过了前端 → 绿
+   *   · 真实浏览器里点「开始」→ `job.id` 是 undefined → 弹「任务创建了但没拿到编号」
+   *     → 详情页永远显示"没有写下目标 / 未知状态 / 团队正在集结"，用户永远等下去
+   *
+   * 修法选择：**在这里统一拆包装**，而不是改 app.js 里的十几处调用点。
+   * 一处修，四处好；而且以后服务端再加包装也只需要动这里。
+   * 同样地，`{ jobs: [...] }` 和裸数组都兼容。
+   */
+  const unwrapJob = (body) =>
+    body && typeof body === 'object' && body.job && typeof body.job === 'object'
+      ? body.job
+      : body;
+
+  const unwrapJobs = (body) => {
+    if (Array.isArray(body)) return body;
+    if (body && Array.isArray(body.jobs)) return body.jobs;
+    return [];
+  };
+
   return {
     origin,
 
     /** POST /api/jobs —— 立即返回 job（后台跑流水线）。 */
-    createJob(input) {
+    async createJob(input) {
       const payload = { goal: String((input && input.goal) || '') };
       if (input && input.templateId) payload.templateId = input.templateId;
       if (input && input.audience) payload.audience = input.audience;
       if (input && input.tone) payload.tone = input.tone;
       if (input && input.deadline) payload.deadline = input.deadline;
       if (input && input.demo) payload.demo = true;
-      return request('/api/jobs', { method: 'POST', body: payload });
+      return unwrapJob(await request('/api/jobs', { method: 'POST', body: payload }));
     },
 
     /** GET /api/jobs */
-    listJobs() {
-      return request('/api/jobs', { method: 'GET' });
+    async listJobs() {
+      return unwrapJobs(await request('/api/jobs', { method: 'GET' }));
     },
 
     /** GET /api/jobs/:id */
-    getJob(id) {
-      return request('/api/jobs/' + encodeURIComponent(id), { method: 'GET' });
+    async getJob(id) {
+      return unwrapJob(await request('/api/jobs/' + encodeURIComponent(id), { method: 'GET' }));
     },
 
     /** POST /api/jobs/:id/message */
-    sendMessage(id, message) {
-      return request('/api/jobs/' + encodeURIComponent(id) + '/message', {
+    async sendMessage(id, message) {
+      // 注意：请求体字段名是 message，但服务端也接受契约里的 text（两个都通）。
+      const body = await request('/api/jobs/' + encodeURIComponent(id) + '/message', {
         method: 'POST', body: { message: String(message || '') },
       });
+      return unwrapJob(body);
     },
 
     /** POST /api/jobs/:id/retry */
-    retryJob(id) {
-      return request('/api/jobs/' + encodeURIComponent(id) + '/retry', { method: 'POST', body: {} });
+    async retryJob(id) {
+      const body = await request('/api/jobs/' + encodeURIComponent(id) + '/retry', {
+        method: 'POST',
+        body: {},
+      });
+      return unwrapJob(body);
     },
 
     /** DELETE /api/jobs/:id */
-    deleteJob(id) {
-      return request('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' });
+    async deleteJob(id) {
+      const body = await request('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' });
+      return body;
     },
 
     /** GET /api/templates —— 失败或为空时返回内置兜底模板（绝不空白页）。 */
@@ -167,9 +201,10 @@ export function createApi(options) {
     /**
      * 取交付物正文（纯文本 markdown）。
      *
-     * 为什么单独取一次：`GET /api/jobs/:id` 出于列表体积考虑**不返回 content**
-     * （S4 的实现与测试都明确如此：详情里只给 bytes/name），正文只存在于下载端点。
-     * 所以详情页按需拉一次，并在内存里缓存。
+     * 说明：`GET /api/jobs/:id` **已经返回 content**（契约 §2 要求如此），
+     * 所以正常情况下详情页不需要调这个方法 —— 调用方应当优先用 `art.content`。
+     * 这里保留作为兜底路径：当拿到的 artifact 只有元信息（旧数据、或将来响应被裁剪）时，
+     * 从下载端点补一次。正文在内存里缓存，复制/下载复用同一份。
      * @returns {Promise<string>}
      */
     async getArtifactText(jobId, artifactId) {

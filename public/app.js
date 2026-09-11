@@ -596,8 +596,49 @@ class JobView {
       if (!this.isOwner()) return;
       this.applyJob(job, false);
     } catch (err) {
-      /* 快照失败不改界面：SSE 可能还活着，保持现状比清空更友好 */
+      // ⚠️ 以前这里是空的 catch —— 后果是两个都很糟：
+      //  1. 任务不存在（服务端明确返回 404 NOT_FOUND），界面却什么都不说，
+      //     骨架屏 +「正在读取任务…」永远停在那里，用户一直等。
+      //  2. 首次加载失败时，外层的错误处理把**任何**非 2xx 都当成网络故障，
+      //     于是提示「网络好像断了。检查一下 Wi-Fi」—— 把一个"任务被删了"
+      //     的问题，变成了用户跑去重启路由器。
+      // 现在：区分"这个任务不存在"和"连不上服务"两种情况，分别说人话。
+      const code = err && err.code ? String(err.code) : '';
+      const status = err && err.status ? Number(err.status) : 0;
+      const notFound = status === 404 || code === 'NOT_FOUND' || code === 'HTTP_404';
+      store.set({
+        jobStatus: 'error',
+        jobError: notFound ? '这个任务不在了' : '暂时读不到这个任务',
+      });
+      if (!this.isOwner()) return;
+      this.renderLoadFailure(notFound, err);
     }
+  }
+
+  /**
+   * 快照读不到时，给一个**能行动**的界面，而不是永远转圈的骨架屏。
+   * @param {boolean} notFound 是"任务不存在"还是"连不上服务"
+   */
+  renderLoadFailure(notFound, err) {
+    clear(this.head);
+    clear(this.stagesList);
+    const title = notFound ? '找不到这个任务' : '暂时读不到这个任务';
+    const body = notFound
+      ? '它可能已经被删除了。你之前做好的东西如果还在，会出现在历史里。'
+      : '可能是服务没在运行，或者网络断了。确认一下服务还在，然后重试。';
+    this.head.appendChild(
+      emptyState({
+        title,
+        body,
+        cta: notFound ? '回历史看看' : '重试',
+        onCta: () => {
+          if (notFound) location.hash = '#/history';
+          else this.refreshSnapshot();
+        },
+      }),
+    );
+    this.failedToLoad = true;
+    void err;
   }
 
   /** 这个视图是否还是"当前在台上的那个"（DOM 更新只允许它来做）。 */
@@ -1335,9 +1376,11 @@ class JobView {
 
   applyJob(job, first) {
     if (!job) {
-      if (!this.job) { this.renderNoJobYet(); }
+      // 已经确定读不到了就别再显示骨架屏（否则用户看到"正在读取"永远转下去）
+      if (!this.job && !this.failedToLoad) { this.renderNoJobYet(); }
       return;
     }
+    this.failedToLoad = false;
     // 已经渲染过、又收到一份同样的快照（SSE 重连补发）：
     // 契约保证它带完整 stages（status/role/ms/log/reason，但不含 stage.output），
     // 所以直接合并即可重新对齐，不必再等一次 GET。

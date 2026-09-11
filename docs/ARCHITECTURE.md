@@ -141,6 +141,8 @@
 | 70 | `verify` | 小验 ✅ 质检员 | `goal` + plan + 最终产物 | `{verdict, checklist[], issues[]}` | 整个 job failed |
 | 80 | `deliver` | 小交 📦 交付专员 | `goal` + plan + 产物名 + review | `{headline, howToUse[], nextSteps[], cautions[]}` | 整个 job failed |
 
+> `verify` 的提示词在最近一轮被特意加了**反过度严苛**的约束：质检员手上只有"执行团队已经交付的内容"，没有原始合同、没有外部资料，所以**不允许**因为"缺少用户没提供的信息/没核实某条政策"判 `needs_revision`——那是材料的限制，不是执行团队的失误。它只判**执行团队自己造成的**问题。理由写在提示词里："放水不对，但**过度严苛同样是失职**——会让用户白等一场还什么都没拿到。"
+
 **"失败影响"是统一的**：任一阶段抛异常 → `runOneStage` 把该阶段标 `failed` 并重新抛出 → `execute` 的 `.catch` 调 `failJob` → `job.status = 'failed'`，同时**已完成的阶段产物与 artifacts 原样保留在盘上**（契约 §3 硬规则 2）。只有取消是例外：`err.code` 是 `LLM_ABORTED`/`PIPELINE_CANCELLED`，或 `err.name === 'AbortError'` 时置 `cancelled`。
 
 **`draft` / `revise` 之后的额外动作**（`engine.js` 的 `execute` 循环体）：
@@ -342,7 +344,11 @@ send(event)
 | stage 的 `name` / `emoji` / `order` / `index` | 虚拟员工的名字、头像、排序（`engine.js` 的 `makeStageRecord`） |
 | `review.reviewedAt` | 质检时间（`normalizeReview`） |
 
-**已知不一致：** 演示模式的 stages 是 fixtures 里严格契约形状的，**没有** `name/emoji/order/index`。任何"按 `stage.order` 排序""用 `stage.emoji` 当头像"的代码会**只在真实模式好用、演示时一片空白**。契约是冻结的，这属于待决策项（QA 缺陷 #9）。
+**接口层还会额外加一个字段：`grade`。** `publicJob()`（`routes/jobs.js`）在 `status === 'done'` 时会挂上 `engine.gradeDelivery(job)` 的结论（`{level, headline, detail}`），给界面显示"质检提了几条意见"。
+
+它必须出现在**详情接口**里，不能只在 SSE 事件里——用户刷新页面走的是 `GET /api/jobs/:id`，快照里没有 `grade` 的话，界面就不知道该怎么提示。取的时候包了 `try/catch` 而不是 `typeof` 判断，因为测试用 `vi.mock()` 替换整个 engine 模块时，vitest 的 Proxy **读取未定义的属性本身就会抛错**，`typeof` 判断会直接把请求打成 500。注释原话："这个坑很隐蔽：单测全绿、e2e 全绿，只有'有人 mock 了这个模块'时才炸。"
+
+**已知不一致：** 演示模式的 stages 是 fixtures 里严格契约形状的，**没有** `name/emoji/order/index`（已实测：`demoJob()` 的 stage 只有 `id,key,title,role,status,startedAt,endedAt,ms,reason,log,output,error`）。任何"按 `stage.order` 排序""用 `stage.emoji` 当头像"的代码会**只在真实模式好用、演示时一片空白**。契约是冻结的，这属于待决策项（QA 缺陷 #9）。
 
 ### 6.2 原子写怎么做
 
@@ -438,30 +444,25 @@ send(event)
 
 **这一节是全文最有价值的部分。** 汇总代码里标 ⚠️ 的地方和各报告里"未修复"的缺陷。
 
-### 8.1 确定是坏的（有 `it.fails` 或用例红着登记）
+### 8.1 确定是坏的（有 `it.fails` 登记）
 
 | # | 问题 | 位置 | 影响 |
 |---|---|---|---|
 | **#11** | 长文本协议下 artifacts **不校验也不收敛**，`confidence: "0.95"` 直接进交付物 | `stages.js` 的 `confidence: b.confidence` | 违反契约；前端徽章静默消失。JSON 退路（`_protocol:'json'`）也一样原样收下 |
 | **#10** | 真实模式**跑不到 done**：慢阶段被"超时→重试→降级"放大 | `gateway.js` 的 `MAX_ATTEMPTS = 2` × 5 个 provider | 缩到 2 次后最坏 10 次尝试，但 `timeoutMs` 仍是 120s、engine **完全不传** `timeoutMs`/`budgetMs`，最坏仍是十几分钟。`usage.calls` 也不计失败尝试 |
-| **#4/#5/#6/#7/#8** | 见 8.2 —— 这几条在最近一轮已被改掉，但**没人把登记它们的测试翻正** | — | 当前 `npx vitest run` **3 个用例是红的** |
-| **#9** | demo 与真实模式的 stage 形状不同（少 `name/emoji/order/index`） | `demo/fixtures.js` vs `engine.js` 的 `makeStageRecord` | 按 `stage.order`/`stage.emoji` 写的界面代码**只在演示时空白** |
+| **#9** | demo 与真实模式的 stage 形状不同（少 `name/emoji/order/index`） | `demo/fixtures.js` vs `engine.js` 的 `makeStageRecord` | 按 `stage.order`/`stage.emoji` 写的界面代码**只在演示时空白**。已实测确认：`demoJob()` 的 stage 字段只有 `id,key,title,role,status,startedAt,endedAt,ms,reason,log,output,error` |
 
 **当前测试状态（我自己跑的，非引用）：**
 
 ```
 $ npx vitest run
- Test Files  1 failed | 7 passed (8)
-      Tests  3 failed | 307 passed | 5 expected fail | 1 skipped (316)
+ Test Files  8 passed (8)
+      Tests  310 passed | 5 expected fail | 1 skipped (316)
 ```
 
-3 条红的是 `tests/e2e/pipeline.test.js` 里**记录"现状"的断言**，因为现状已经变好了：
+**全绿。但那 5 条 `expected fail` 是"已知缺陷登记"，绿着恰恰说明缺陷还在**——`it.fails` 的语义是"这条断言现在应该失败"。它们覆盖的是上表里的行为（超时放大、长文本协议下的 confidence 校验等）。**修好任何一条，对应的 `it.fails` 会变红，提醒你改成 `it(...)` 正断言。**
 
-- `取消任务 → status 应为 cancelled`（断言 `toBe('failed')`）——engine 现在按 `err.name === 'AbortError'` 判定，实际是 `cancelled` → 断言失败
-- `【缺陷 #4】... 应为 cancelled`（`it.fails`）——现在真的 `cancelled` 了，`it.fails` 反而失败
-- `前端发消息字段名不一致 → 现在的表现`（断言 `asFrontend` 应为 400）——后端现在**同时接受** `text` 和 `message`，返回 200 → 断言失败
-
-**这三条不是回归，是"缺陷修好后测试没跟着改"。** 交接前必须处理：把前两条改成 `toBe('cancelled')`、把第三条改成"两个字段名都应该 200"。
+`docs/TESTING.md` §5.1 那张"还没修"的表里，`#4`/`#5`/`#6`/`#7`/`#8` 五条**在最近两轮已修**（取消判定接受 `AbortError`、`/message` 兼容两个字段名、收敛通知改用 `changed` 标志、`app.listen` 检查 error、`HANDOFF_DEMO` 接上 `runtime-flags.js`），但那份文档和 S8 的报告没同步更新——**看缺陷清单时要对着代码核一遍，报告里的"现状"可能已经过时。**
 
 ### 8.2 代码注释里标 ⚠️ 的历史坑（已修，但改回去很容易重犯）
 
@@ -514,7 +515,8 @@ $ npx vitest run
 
 | 承诺 | 出处 | 现状 |
 |---|---|---|
-| `docs/PLAYBOOK.md` | `README.md` 的文档表格 | **文件不存在**（README 自己列了它） |
+| `docs/PLAYBOOK.md` | `README.md` 的文档表格 | ✅ 已补上（我写本文时还不存在，见 `docs/reports/S12-文档.md` 的并行开发说明） |
+| `docs/COPY-GUIDELINES.md` | — | 我写本文时新增的文件，未纳入本文档体系 |
 | `docs/ARCHITECTURE.md` | README / CONTRACT §1 | 本文（S12 补上） |
 | `docs/DECISIONS.md` | README / CONTRACT §1 | S12 补上 |
 | `src/util/ids.js` | `CONTRACT.md` §1 | **不存在**，`newId` 在 `store/events.js`（BRIEF 第 49 行已声明作废，契约没同步改） |

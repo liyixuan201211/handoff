@@ -60,15 +60,26 @@ describe('回归：引擎依赖装载（缺陷 #1 已修复，这里防止复发
     const id = created.body.job.id;
     await waitForJob(app, id);
 
-    // 注意：状态是内存里的对象先变，磁盘写入是异步的 ——
-    // 直接 existsSync 会偶发失败（全仓并行跑、机器慢的时候更容易撞上）。
-    // 这里给落盘 5 秒的等待窗口。
+    // 内存里的状态先变，磁盘写入是紧随其后的独立异步操作，
+    // 所以这里给一个等待窗口，而不是立刻 existsSync —— 否则偶发失败，
+    // 而"偶发失败的测试"比没有测试更糟：它会训练人忽略红色。
+    //
+    // 另外：这个用例曾在全仓并行跑时偶发失败（同一机器上还有基准测试和对抗性
+    // 测试在起进程、写文件，I/O 队列被占满）。所以窗口给到 15 秒，
+    // 失败时把目录内容一并打出来，便于判断是"慢"还是"真的没写"。
     const file = path.join(dataDir, 'jobs', `${id}.json`);
-    const deadline = Date.now() + 5000;
+    const deadline = Date.now() + 15_000;
     while (!fs.existsSync(file) && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 50));
     }
-    expect(fs.existsSync(file)).toBe(true);
+    if (!fs.existsSync(file)) {
+      const listing = fs.existsSync(path.join(dataDir, 'jobs'))
+        ? fs.readdirSync(path.join(dataDir, 'jobs')).join(', ')
+        : '(jobs 目录不存在)';
+      throw new Error(
+        `任务 ${id} 跑完了但 15 秒内没有落盘。dataDir=${dataDir}\n盘上现有文件：${listing}`,
+      );
+    }
     const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
     expect(onDisk.id).toBe(id);
     expect(onDisk.status).toBe('done');
@@ -446,13 +457,14 @@ describe('C. 失败与边界（最容易出 bug 的地方）', () => {
     expect(after.filter((e) => e.type === 'artifact')).toHaveLength(0);
     expect(job.status).not.toBe('running');
 
-    // 现状记录：演示流水线抛的是 name=AbortError 的普通 Error，引擎只看 err.code，
-    // 所以被当成「失败」而不是「取消」（缺陷 #4）。修好之后本行会红 → 改成 toBe('cancelled')。
-    expect(job.status).toBe('failed');
+    // 回归（缺陷 #4 已修复）：演示流水线抛的是 name=AbortError 的普通 Error，
+    // 引擎现在同时认 code 和 name，所以正确判为「取消」而不是「失败」。
+    // 用户主动取消却看到"任务失败"，会以为是自己弄坏了什么 —— 这个差别很重要。
+    expect(job.status).toBe('cancelled');
     expect(job.error.message).toContain('取消');
   }, 40_000);
 
-  it.fails('【缺陷 #4】用户主动取消 → status 应为 cancelled（而不是 failed）', async () => {
+  it('回归（缺陷 #4 已修复）：用户主动取消 → status 为 cancelled', async () => {
     const created = await request(app).post('/api/jobs').send({ goal: '取消断言：帮我写方案', demo: true });
     const id = created.body.job.id;
     await waitForJob(app, id, {
@@ -536,20 +548,25 @@ describe('C. 失败与边界（最容易出 bug 的地方）', () => {
     expect(res.body.error.code).toBe('BAD_REQUEST');
   });
 
-  it('前端发消息用的字段名与后端读取的字段名不一致 → 现在的表现', async () => {
-    const created = await request(app).post('/api/jobs').send({ goal: '消息字段测试', demo: true });
-    const id = created.body.job.id;
-    await waitForJob(app, id);
+  it('回归（缺陷 #5 已修复）：前端发 { message } 与契约的 { text } 都必须能用', async () => {
+    // 这是「两边各自的测试都绿、合起来 100% 坏」的典型案例：
+    // public/api.js 发 { message }，routes/jobs.js 原本只读 req.body.text。
+    // 用户点"补充要求"永远 400 —— 而两边的单测都发现不了。
+    // 每条断言用**独立的任务**。
+    // 原因：sendMessage 会让流水线从 draft 起重跑，同一个任务连发两次时
+    // 第二次会撞上"任务正在执行中"→ 409（这是正确行为，app.js 也会禁用输入框）。
+    // 之前这里共用一个 job，导致偶发 409 flake。
+    const send = async (body) => {
+      const created = await request(app).post('/api/jobs').send({ goal: '消息字段测试', demo: true });
+      const id = created.body.job.id;
+      await waitForJob(app, id);
+      return request(app).post(`/api/jobs/${id}/message`).send(body);
+    };
 
-    // public/api.js 发的是 { message }，routes/jobs.js 读的是 req.body.text
-    const asFrontend = await request(app).post(`/api/jobs/${id}/message`).send({ message: '再补一句' });
-    const asRoute = await request(app).post(`/api/jobs/${id}/message`).send({ text: '再补一句' });
-
-    expect(asFrontend.status).toBe(400); // 现状：前端这么发会被拒
-    expect(asRoute.status).toBe(200); // 只有 text 能用
-
-    await waitForJob(app, id, { timeoutMs: 60_000, intervalMs: 100 }); // 让它跑完，别留后台任务
-  }, 90_000);
+    expect((await send({ message: '再补一句' })).status).toBe(200); // 前端用的名字
+    expect((await send({ text: '再补一句' })).status).toBe(200); // 契约里的名字
+    expect((await send({})).status).toBe(400); // 两个都不给 → 400，不能静默接受空消息
+  }, 120_000);
 
   it('回归：模型把 confidence 写成 "0.95" → 不会再毁掉输出，任务照常 done（缺陷 #1 已修复）', async () => {
     // 这一条走**真实网关**（只把 HTTP 传输换掉），因为收敛发生在 schema-check 里。

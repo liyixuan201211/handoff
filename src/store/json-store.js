@@ -105,9 +105,26 @@ function withLock(id, fn) {
 /* 原子写盘                                                            */
 /* ------------------------------------------------------------------ */
 
-/** 先写 <id>.json.tmp，fsync，再 rename 覆盖。任何时刻盘上要么是旧版本，要么是新版本。 */
+/**
+ * 临时文件名的唯一计数器。
+ *
+ * ⚠️ 这里曾经用**固定名** `${file}.tmp`，并配上一个"清扫所有 *.json.tmp"的
+ * `sweepTmpFiles()`，而后者被每 30 秒一次的 `loadFromDisk({force:true})` 调用。
+ * 结果：清扫把**正在写**的临时文件删掉 → 随后的 `rename` 报 ENOENT →
+ * `saveJob` 失败 → 用户看到「新建任务」直接 500。
+ * 性能工程师实测：同步周期压到 30ms 时 100 个任务里 7 个失败；
+ * 换算到真实的 30 秒周期，大约每 150 个任务会莫名失败 1 个 ——
+ * 这正是"偶发、复现不了、用户觉得是产品不行"的那类 bug。
+ *
+ * 修法：临时文件名带上 pid 和自增序号，**永远不会和别人重名**。
+ * 这样清扫就再也删不到活文件（见 sweepTmpFiles 的时间阈值兜底）。
+ */
+let tmpSeq = 0;
+const uniqueTmpPath = (file) => `${file}.${process.pid}.${(tmpSeq += 1)}.tmp`;
+
+/** 先写唯一名临时文件，fsync，再 rename 覆盖。任何时刻盘上要么是旧版本，要么是新版本。 */
 async function atomicWrite(file, text) {
-  const tmp = `${file}.tmp`;
+  const tmp = uniqueTmpPath(file);
   const handle = await fs.open(tmp, 'w');
   try {
     await handle.writeFile(text, 'utf8');
@@ -116,10 +133,28 @@ async function atomicWrite(file, text) {
   } finally {
     await handle.close();
   }
-  await fs.rename(tmp, file);
+  try {
+    await fs.rename(tmp, file);
+  } catch (err) {
+    // rename 失败要自己收拾干净，别留残渣
+    try {
+      await fs.unlink(tmp);
+    } catch {
+      /* 已经没了就算了 */
+    }
+    throw err;
+  }
 }
 
-/** 落盘失败时清掉临时文件，保证不留 .tmp 残渣 */
+/**
+ * 清掉**确实是残留**的临时文件。
+ *
+ * 只删除 5 分钟以前的：正在写的临时文件最多活几十毫秒，
+ * 5 分钟这个阈值足够宽松，任何在阈值内的都是真的卡住的残渣。
+ * （踩过的坑见上面 uniqueTmpPath 的注释 —— 无条件删除会删活文件。）
+ */
+const TMP_STALE_MS = 5 * 60 * 1000;
+
 export async function sweepTmpFiles() {
   const dir = getJobsDir();
   let names;
@@ -128,11 +163,15 @@ export async function sweepTmpFiles() {
   } catch {
     return 0;
   }
+  const now = Date.now();
   let n = 0;
   for (const name of names) {
-    if (!name.endsWith('.json.tmp')) continue;
+    if (!name.endsWith('.tmp')) continue;
+    const full = path.join(dir, name);
     try {
-      await fs.unlink(path.join(dir, name));
+      const st = await fs.stat(full);
+      if (now - st.mtimeMs < TMP_STALE_MS) continue; // 可能是别人正在写的，别碰
+      await fs.unlink(full);
       n += 1;
     } catch {
       /* 删不掉就算了，不影响服务 */

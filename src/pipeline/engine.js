@@ -19,6 +19,14 @@ import { callModel as realCallModel } from '../llm/gateway.js';
 import { AppError, ERR, redactSecrets } from '../llm/errors.js';
 import { events, newId } from '../store/events.js';
 import { isDemoMode } from '../runtime-flags.js';
+
+/**
+ * 交付物"够不够像样"的判定阈值。
+ *
+ * 从安全模块取同一个数（`guard.js` 导出），避免"门禁用一个数、安全审计用另一个数"
+ * 这种悄悄漂移。guard 不在时退化为 80。
+ */
+let MIN_ARTIFACT_LENGTH = 80;
 import { stageDisplay, STAGE_META, normalizeStages, STAGE_RUNNERS } from './stages.js';
 import { SCHEMAS, systemPromptFor, buildUser, TEAM } from '../prompts/index.js';
 
@@ -77,6 +85,9 @@ export async function loadOptionalDeps() {
     const guard = await optional('../security/guard.js');
     if (guard) {
       deps.guard = guard;
+      if (typeof guard.MIN_ARTIFACT_LENGTH === 'number') {
+        MIN_ARTIFACT_LENGTH = guard.MIN_ARTIFACT_LENGTH;
+      }
       // 把安全的隔离实现注入提示词层，避免循环依赖
       const prompts = await optional('../prompts/index.js');
       prompts?.setUntrustedWrapper?.(guard.wrapUntrusted);
@@ -172,7 +183,21 @@ export function buildJobRecord(input) {
 export async function startJob(input) {
   await loadOptionalDeps();
 
-  const rawGoal = String(input?.goal ?? '');
+  const goalInput = input?.goal;
+
+  // ⚠️ 类型必须先判，不能一上来就 `String(...)`。
+  // 后果实测：`{"goal": {"a":1}}` 会被 String() 成 "[object Object]" 存进任务里，
+  // 界面显示「[object Object]」，模型收到一段乱码还得硬着头皮做 ——
+  // 用户看到的是"这玩意坏了"。契约 §2 说的是字符串 1..4000 字，那就按契约来。
+  if (goalInput !== undefined && goalInput !== null && typeof goalInput !== 'string') {
+    throw new AppError(
+      ERR.BAD_REQUEST,
+      '请用一段文字描述你要办的事（目前收到的是其它格式的内容）。',
+      { status: 400 },
+    );
+  }
+
+  const rawGoal = String(goalInput ?? '');
   if (!rawGoal.trim()) {
     throw new AppError(ERR.BAD_REQUEST, '请先告诉我们要办什么事。', { status: 400 });
   }
@@ -916,19 +941,41 @@ function buildDeliverArtifact(job, deliverOut) {
 async function runSecurityAudit(job, artifacts) {
   if (!deps.guard?.auditJob) return null;
   try {
-    return deps.guard.auditJob({ artifacts, review: job.review, plan: job.plan });
+    // ⚠️ 必须传 `security`（输入阶段 sanitize 得到的 findings）。
+    // guard.auditJob 里有一段专门"把输入阶段的注入 finding 合并进来"的逻辑，
+    // 不传的话那段是死代码 —— 用户粘进来的可疑内容就不会出现在最终安全报告里。
+    return deps.guard.auditJob({
+      artifacts,
+      review: job.review,
+      plan: job.plan,
+      security: job.security,
+    });
   } catch {
     return null; // 审计失败不能导致交付失败
   }
 }
 
+/**
+ * 合并输入阶段与输出阶段的安全结论。
+ *
+ * **必须去重**：不传 security 时 guard 会把同一个 finding 在两处各报一次，
+ * 用户看到"发现 2 处可疑内容"其实只是同一件事，会以为情况更严重。
+ */
 function mergeSecurity(a, b) {
   if (!a) return b ?? null;
   if (!b) return a;
   const rank = { clean: 0, notice: 1, blocked: 2 };
+  const seen = new Set();
+  const findings = [];
+  for (const f of [...(a.findings ?? []), ...(b.findings ?? [])]) {
+    const key = `${f?.kind ?? ''}|${f?.detail ?? ''}|${f?.where ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    findings.push(f);
+  }
   return {
     level: rank[b.level] > rank[a.level] ? b.level : a.level,
-    findings: [...(a.findings ?? []), ...(b.findings ?? [])],
+    findings,
   };
 }
 
@@ -959,15 +1006,20 @@ export function validateDelivery(job) {
   );
   if (!realArtifacts.length) problems.push('没有产出任何可用的内容');
 
-  const substantial = realArtifacts.filter(
-    (a) => typeof a.content === 'string' && a.content.replace(/\s/g, '').length > 80,
-  );
+  // 长度按**去掉空白后的字符数**算，不是 content.length。
+  // 原因：500 个空格能让 content.length 轻松超过阈值，从而骗过质量门禁。
+  // 阈值取自安全模块导出的 MIN_ARTIFACT_LENGTH —— 那个常量存在的意义就是
+  //"门禁和安全审计用同一个数"，这里硬编码字面量会让两者悄悄漂移。
+  const minLen = MIN_ARTIFACT_LENGTH;
+  const visibleLength = (a) =>
+    typeof a.content === 'string' ? a.content.replace(/\s/g, '').length : 0;
+  const substantial = realArtifacts.filter((a) => visibleLength(a) > minLen);
   if (realArtifacts.length && !substantial.length) {
     problems.push('产出的内容太少，没有实际价值');
   }
-  // 只要有一份像样的东西，就算部分成功；全都不像样才是失败
-  for (const a of substantial) {
-    if (a.content.replace(/\s/g, '').length <= 80) {
+  // 逐份检查：某一份明显偏短也值得记下来（不是失败，只是让用户知道）
+  for (const a of realArtifacts) {
+    if (visibleLength(a) > 0 && visibleLength(a) <= minLen) {
       problems.push(`「${a.name}」内容太短`);
     }
   }
@@ -1007,48 +1059,63 @@ export function gradeDelivery(job) {
  * ──────────────────────────────────────────────────────────────── */
 
 export async function sendMessage(jobId, text) {
-  await loadOptionalDeps();
   const clean = String(text ?? '').trim();
   if (!clean) throw new AppError(ERR.BAD_REQUEST, '内容不能为空。', { status: 400 });
   if (clean.length > MAX_MESSAGE) {
     throw new AppError(ERR.BAD_REQUEST, `补充内容太长了，请控制在 ${MAX_MESSAGE} 字内。`, { status: 400 });
   }
 
-  const job = await load(jobId);
-  if (!job) throw new AppError(ERR.NOT_FOUND, '没找到这个任务。', { status: 404 });
-  if (running.has(jobId)) {
-    throw new AppError(ERR.BAD_REQUEST, '任务正在执行中，请等它跑完再补充要求。', { status: 409 });
+  // ⚠️ 和 retryJob 同一个竞态（对抗性测试实测：并发 5 次 message 全部 200，
+  // 结果 userMessages: 5 / amendedCount: 5，5 条并行流水线）。
+  // 用户在手机上双击回车、或者网络重试，就会中招 —— 他只想补充一句，
+  // 却让同一件事被做了 5 遍，还要为 5 遍付费。
+  // 所以**必须在任何 await 之前先占位**。
+  const claim = claimJob(jobId);
+  if (!claim.claimed) {
+    throw new AppError(ERR.BAD_REQUEST, '上一句还在处理，稍等一下再说下一句。', { status: 409 });
   }
 
-  let messageText = clean;
-  if (deps.guard?.sanitizeUserInput) {
-    const s = deps.guard.sanitizeUserInput(clean, { maxLength: MAX_MESSAGE, field: 'message' });
-    if (!s.ok) throw new AppError(ERR.BAD_REQUEST, s.reason ?? '内容不合法。', { status: 400 });
-    messageText = s.text;
+  try {
+    await loadOptionalDeps();
+    const job = await load(jobId);
+    if (!job) {
+      running.delete(jobId);
+      throw new AppError(ERR.NOT_FOUND, '没找到这个任务。', { status: 404 });
+    }
+
+    let messageText = clean;
+    if (deps.guard?.sanitizeUserInput) {
+      const s = deps.guard.sanitizeUserInput(clean, { maxLength: MAX_MESSAGE, field: 'message' });
+      if (!s.ok) throw new AppError(ERR.BAD_REQUEST, s.reason ?? '内容不合法。', { status: 400 });
+      messageText = s.text;
+    }
+
+    job.userMessages.push({ at: Date.now(), text: messageText });
+    job.amendedCount = (job.amendedCount ?? 0) + 1;
+    job.updatedAt = Date.now();
+
+    // 等待澄清回答：这次带上用户的回答重跑，「理解需求」不会再反问
+    if (job.status === 'awaiting_input') job.clarifyQuestions = [];
+    // 已有产物 → 从「动手做」之前重跑（复用已经定好的方案，省时间也省钱）
+    const restartKey = job.artifacts?.length ? 'draft' : 'intake';
+
+    await save(job);
+    events.publish(jobId, { type: 'job', job: summarize(job) });
+
+    // 复用已占位的那把 controller，否则用户立刻点取消会取消不掉
+    const entry = running.get(jobId) ?? claim.entry;
+    entry.controller ??= new AbortController();
+    running.set(jobId, entry);
+    const promise = rerunFrom(job, restartKey, entry.controller.signal).catch((err) =>
+      failJob(jobId, err),
+    );
+    entry.promise = promise;
+
+    return { ok: true, restartedFrom: restartKey };
+  } catch (err) {
+    releaseClaim(jobId, running.get(jobId));
+    throw err;
   }
-
-  job.userMessages.push({ at: Date.now(), text: messageText });
-  job.amendedCount = (job.amendedCount ?? 0) + 1;
-  job.updatedAt = Date.now();
-
-  // 等待澄清回答：这次带上用户的回答重跑，「理解需求」不会再反问
-  if (job.status === 'awaiting_input') job.clarifyQuestions = [];
-  // 已有产物 → 从「动手做」之前重跑（复用已经定好的方案，省时间也省钱）
-  const restartKey = job.artifacts?.length ? 'draft' : 'intake';
-
-  await save(job);
-  events.publish(jobId, { type: 'job', job: summarize(job) });
-
-  const controller = new AbortController();
-  // 先登记 controller，再启动；否则用户立刻点取消会取消不掉
-  running.set(jobId, { controller, promise: null });
-  const promise = rerunFrom(job, restartKey, controller.signal).catch((err) =>
-    failJob(jobId, err),
-  );
-  const entry = running.get(jobId);
-  if (entry) entry.promise = promise;
-
-  return { ok: true, restartedFrom: restartKey };
 }
 
 /**
@@ -1089,27 +1156,70 @@ async function rerunFrom(job, fromKey, signal) {
   return execute(job);
 }
 
+/**
+ * 认领一个任务（原子操作）。
+ *
+ * ⚠️ 这是本项目最贵的一个竞态，务必理解：
+ * 原来是「先 `await load()`，再检查 `running.has()`，最后才 `running.set()`」——
+ * 也就是 check-then-act。两次并发 retry 都会在第一个 await 处让出事件循环，
+ * 于是**两个请求都通过了检查**，同一个任务被跑了两遍。
+ * 真实模式下的后果不是"数据错乱"这么轻：**用户的模型费翻倍**，
+ * 而且前一条流水线变成没人能取消的孤儿。
+ *
+ * 修法：**在任何 await 之前先占位**。JS 是单线程的，同步的 get-then-set 之间
+ * 不会被插入别的请求，所以这一步天然是原子的。
+ *
+ * @returns {{ claimed: true } | { claimed: false, reason: 'running' }}
+ */
+function claimJob(jobId) {
+  if (running.has(jobId)) return { claimed: false, reason: 'running' };
+  const entry = { controller: new AbortController(), promise: null, claimedAt: Date.now() };
+  running.set(jobId, entry);
+  return { claimed: true, entry };
+}
+
+/** 认领失败时释放占位（避免占着坑什么都不干） */
+function releaseClaim(jobId, entry) {
+  if (running.get(jobId) === entry) running.delete(jobId);
+}
+
 export async function retryJob(jobId) {
-  await loadOptionalDeps();
-  const job = await load(jobId);
-  if (!job) throw new AppError(ERR.NOT_FOUND, '没找到这个任务。', { status: 404 });
-  if (running.has(jobId)) {
-    throw new AppError(ERR.BAD_REQUEST, '任务正在执行中。', { status: 409 });
+  // ① 先占位，再 await —— 顺序反了就是上面那个竞态
+  const claim = claimJob(jobId);
+  if (!claim.claimed) {
+    throw new AppError(ERR.BAD_REQUEST, '这个任务正在执行中，不用重复点。', { status: 409 });
   }
-  const failedStage = (job.stages ?? []).find((s) => s.status === 'failed');
-  const fromKey = failedStage?.key ?? (job.artifacts?.length ? 'draft' : 'intake');
 
-  job.status = 'queued';
-  job.error = null;
-  job.updatedAt = Date.now();
-  await save(job);
+  try {
+    await loadOptionalDeps();
+    const job = await load(jobId);
+    if (!job) {
+      running.delete(jobId);
+      throw new AppError(ERR.NOT_FOUND, '没找到这个任务。', { status: 404 });
+    }
+    const failedStage = (job.stages ?? []).find((s) => s.status === 'failed');
+    const fromKey = failedStage?.key ?? (job.artifacts?.length ? 'draft' : 'intake');
 
-  const controller = new AbortController();
-  const promise = rerunFrom(job, fromKey, controller.signal).catch((err) => failJob(jobId, err));
-  running.set(jobId, { controller, promise });
+    job.status = 'queued';
+    job.error = null;
+    job.updatedAt = Date.now();
+    await save(job);
 
-  const fresh = await load(jobId);
-  return fresh ?? job;
+    // ② 复用已占位的那把 controller（否则用户点取消会取消不掉）
+    const entry = running.get(jobId) ?? { controller: new AbortController(), promise: null };
+    running.set(jobId, entry);
+    const promise = rerunFrom(job, fromKey, entry.controller.signal).catch((err) =>
+      failJob(jobId, err),
+    );
+    entry.promise = promise;
+
+    const fresh = await load(jobId);
+    return fresh ?? job;
+  } catch (err) {
+    // 任何异常都不能把占位留在那里，否则这个任务永远"正在执行中"
+    releaseClaim(jobId, running.get(jobId));
+    throw err;
+  }
 }
 
 export function cancelJob(jobId) {

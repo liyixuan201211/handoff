@@ -410,7 +410,23 @@ export function parseRoute(hash) {
   let query = '';
   if (qIndex >= 0) { query = raw.slice(qIndex + 1); raw = raw.slice(0, qIndex); }
   raw = raw.replace(/^#/, '');
-  const parts = raw.split('/').filter((p) => p.length > 0).map((p) => decodeURIComponent(p));
+
+  // ⚠️ `decodeURIComponent` 对畸形百分号编码（例如 `#/job/%E4%B8`）会抛 URIError。
+  // 这个函数在路由分发的最前面被调用，**没有外层 try/catch**，
+  // 所以一个畸形的 URL 就能让整个路由卡死 —— 之后连正常的路由也一直报错，
+  // 用户看到的是"点了没反应"。一个字符的容错就能解决：
+  // 解不开的片段就当字面量用，至少界面还能正常导航。
+  const safeDecode = (seg) => {
+    try {
+      return decodeURIComponent(seg);
+    } catch {
+      return seg;
+    }
+  };
+  const parts = raw
+    .split('/')
+    .filter((p) => p.length > 0)
+    .map((p) => safeDecode(p));
 
   let route;
   if (parts.length === 0) route = { name: 'home', params: {} };

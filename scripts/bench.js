@@ -34,6 +34,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import { createHash } from 'node:crypto';
 import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -113,6 +114,48 @@ function metric({ section, name, value, verdict, basis }) {
   console.log(`  ${pad(name, 46)} ${padL(value, 18)}${v}`);
   if (basis) console.log(`  ${' '.repeat(46)} ${'↳ ' + basis}`);
 }
+
+/** 被测量的源码指纹：数字必须能对得上某一次具体的代码状态 */
+function sourceFingerprint() {
+  const files = [
+    'src/server.js',
+    'src/store/events.js',
+    'src/store/json-store.js',
+    'src/routes/jobs.js',
+    'src/routes/stream.js',
+    'src/util/sse.js',
+    'src/pipeline/engine.js',
+    'src/pipeline/stages.js',
+    'src/runtime-flags.js',
+  ];
+  const rev = (() => {
+    try {
+      const r = spawnSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: ROOT, encoding: 'utf8' });
+      return r.status === 0 ? r.stdout.trim() : 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  })();
+  const dirty = (() => {
+    try {
+      const r = spawnSync('git', ['status', '--porcelain', '--', 'src'], { cwd: ROOT, encoding: 'utf8' });
+      return r.status === 0 && r.stdout.trim() !== '';
+    } catch {
+      return false;
+    }
+  })();
+  const hashes = files
+    .map((f) => {
+      try {
+        const buf = fs.readFileSync(path.join(ROOT, f));
+        return `${f}@${createHash('sha256').update(buf).digest('hex').slice(0, 12)}`;
+      } catch {
+        return `${f}@missing`;
+      }
+    })
+    .join(' ');
+  return { rev, dirty, hashes };
+}
 function section(title) {
   console.log('');
   console.log(`\x1b[1m== ${title} ==\x1b[0m`);
@@ -174,7 +217,7 @@ function judgeLatency(p50, p95) {
  * 模块（动态 import：必须在 HANDOFF_DATA_DIR 设好之后）
  * ------------------------------------------------------------------ */
 
-const { createApp, VERSION } = await import(path.join(ROOT, 'src/server.js'));
+const { createApp, VERSION, markInterruptedJobs } = await import(path.join(ROOT, 'src/server.js'));
 const engine = await import(path.join(ROOT, 'src/pipeline/engine.js'));
 const store = await import(path.join(ROOT, 'src/store/json-store.js'));
 const { events } = await import(path.join(ROOT, 'src/store/events.js'));
@@ -597,57 +640,144 @@ async function benchMemory() {
     gcNow();
     const retainHeap = heapMB();
     const retained = eventsRetainedBytes(seen);
+    const cacheAt200 = await store.countJobs();
+
+    /* 继续加到 500：json-store 的内存缓存到 200 就封顶了，
+       所以 201..500 的堆增量**只可能**来自 events 的事件日志 —— 用它把泄漏单独量出来。 */
+    const MORE = 300;
+    for (let i = 0; i < MORE; i += 1) {
+      const created = await postJson(base, '/api/jobs', { goal: `保留口径第 ${RETAIN + i + 1} 轮`, demo: true });
+      const id = created.body.job.id;
+      seen.push(id);
+      await waitJob(base, id);
+    }
+    gcNow();
+    const heapAt500 = heapMB();
+    const retained500 = eventsRetainedBytes(seen);
+    const cacheAt500 = await store.countJobs();
     const diskBytes = fs
       .readdirSync(path.join(DATA_DIR, 'jobs'))
       .filter((n) => n.endsWith('.json'))
       .reduce((a, n) => a + fs.statSync(path.join(DATA_DIR, 'jobs', n)).size, 0);
 
     table(
-      ['口径', '任务数', 'heapUsed', 'events 常驻字节', '事件条数', '磁盘字节'],
+      ['口径', '任务数', 'heapUsed', '内存缓存', 'events 常驻(序列化)', '磁盘'],
       [
-        [
-          '删除后（应回到基线）',
-          '0',
-          baseHeap.toFixed(1) + ' MB',
-          '0 B',
-          '0',
-          '0',
-        ],
-        [
-          '全部保留',
-          String(RETAIN),
-          retainHeap.toFixed(1) + ' MB',
-          fmtMB(retained.bytes / 1048576),
-          String(retained.count),
-          `${(diskBytes / 1024).toFixed(0)} KB`,
-        ],
+        ['删除后（基线）', '0', retainBase.toFixed(1) + ' MB', '0 个', '0 B', '0 B'],
+        ['保留 200', String(RETAIN), retainHeap.toFixed(1) + ' MB', `${cacheAt200} 个`, fmtMB(retained.bytes / 1048576), `${(diskBytes / 1024).toFixed(0)} KB`],
+        ['保留 500', String(RETAIN + MORE), heapAt500.toFixed(1) + ' MB', `${cacheAt500} 个`, fmtMB(retained500.bytes / 1048576), `${(diskBytes / 1024).toFixed(0)} KB`],
       ],
     );
-    const perJobEvents = retained.bytes / RETAIN;
+
     const perJobHeap = (retainHeap - retainBase) / RETAIN;
+    const perJobEventsHeap = (heapAt500 - retainHeap) / MORE; // 缓存已封顶，这一段只涨 events
+    const perJobEventsBytes = (retained500.bytes - retained.bytes) / MORE;
     metric({
       section: '内存',
-      name: '每个「保留下来没删」的任务常驻事件字节',
-      value: `${(perJobEvents / 1024).toFixed(1)} KB`,
-      verdict: perJobEvents > 200 * 1024 ? BAD : WARN,
-      basis: 'events.js:14 #logs 每个 job 的条目永不回收（只按 500 条封顶），随「进程生命周期内建过的任务数」线性增长',
+      name: '每个「保留下来没删」的任务常驻事件字节（序列化）',
+      value: `${(perJobEventsBytes / 1024).toFixed(1)} KB`,
+      verdict: perJobEventsBytes > 200 * 1024 ? BAD : WARN,
+      basis: 'events.js:14 #logs 每个 job 的条目永不回收（只按 500 条封顶），随「进程生命周期内建过的任务数」线性增长；只有 DELETE 会清',
     });
     metric({
       section: '内存',
-      name: '保留口径 heap 增量 / 任务',
-      value: `${(perJobHeap * 1024).toFixed(0)} KB`,
-      verdict: perJobHeap * 1024 < 256 ? OK : perJobHeap * 1024 < 1024 ? WARN : BAD,
-      basis: '用来估算「跑一晚上涨多少」：新增任务数 × 该值',
+      name: '事件日志的真实堆成本 / 任务（200→500 段斜率）',
+      value: `${(perJobEventsHeap * 1024).toFixed(1)} KB`,
+      verdict: perJobEventsHeap * 1024 < 256 ? OK : perJobEventsHeap * 1024 < 1024 ? WARN : BAD,
+      basis: '200→500 期间内存缓存已封顶（恒为 200），堆增量只可能来自 events 日志 —— 这是隔离出来的纯泄漏斜率',
+    });
+    metric({
+      section: '内存',
+      name: '内存缓存上限是否稳定在 MAX_MEMORY_JOBS=200',
+      value: `${cacheAt500} 个`,
+      verdict: cacheAt500 === 200 ? OK : WARN,
+      basis: 'json-store.js:20 / 153-161：缓存里存的是**带交付物正文的完整 job**，所以「200 个任务」的常驻内存取决于单个任务多大',
+    });
+    metric({
+      section: '内存',
+      name: '保留 200 个任务后的 heapUsed 增量',
+      value: `+${(retainHeap - retainBase).toFixed(1)} MB`,
+      verdict: retainHeap - retainBase < 32 ? OK : retainHeap - retainBase < 128 ? WARN : BAD,
+      basis: '这一部分内存只有两种方式释放：进程重启，或用户手动删任务（普通人不会删）',
+    });
+    metric({
+      section: '内存',
+      name: '保留 500 个任务后的 heapUsed 增量',
+      value: `+${(heapAt500 - retainBase).toFixed(1)} MB`,
+      verdict: heapAt500 - retainBase < 64 ? OK : heapAt500 - retainBase < 256 ? WARN : BAD,
+      basis: `${(perJobEventsHeap * 1024).toFixed(0)} KB/任务 × 500 + 封顶的 200 任务缓存；单调上升，没有回落机制`,
     });
 
     const overnightTasks = 60; // 一个人一晚上大约提多少个任务（保守：每 8 分钟一个 × 8 小时）
     metric({
       section: '内存',
-      name: `推算：一晚（8h / 约 ${overnightTasks} 个任务）内存增量`,
-      value: `≈ ${((perJobHeap * overnightTasks)).toFixed(1)} MB`,
-      verdict: perJobHeap * overnightTasks < 32 ? OK : perJobHeap * overnightTasks < 128 ? WARN : BAD,
-      basis: `保留口径实测 ${(perJobHeap * 1024).toFixed(0)} KB/任务 × ${overnightTasks}；注意这部分内存**永不归还**，且任务越多越大`,
+      name: `推算：一晚（8h / 约 ${overnightTasks} 个任务）事件日志增量`,
+      value: `≈ ${(perJobEventsHeap * overnightTasks).toFixed(1)} MB`,
+      verdict: perJobEventsHeap * overnightTasks < 32 ? OK : perJobEventsHeap * overnightTasks < 128 ? WARN : BAD,
+      basis: `实测斜率 ${(perJobEventsHeap * 1024).toFixed(0)} KB/任务（heap） × ${overnightTasks}；这部分内存**永不归还**`,
     });
+
+    /* --- 1.2b 大任务口径：缓存里存的是带正文的完整 job --- */
+    section('1b. 大交付物口径：内存缓存里存的是「带正文的完整 job」');
+    const bigTemplate = JSON.parse(JSON.stringify(await store.getJob(seen[0])));
+    const bigPerArtifact = Math.round((500 * 1024) / Math.max(1, bigTemplate.artifacts.length) / 3);
+    bigTemplate.artifacts = bigTemplate.artifacts.map((a, i) => ({ ...a, content: filler(bigPerArtifact, `m${i}`) }));
+    bigTemplate.plan = null;
+    bigTemplate.stages = [];
+    const oneBig = JSON.stringify(bigTemplate, null, 2).length;
+    dropAll(seen);
+    seen.length = 0;
+    store.resetStore();
+    const bigDir = path.join(DATA_DIR, 'jobs');
+    for (const name of await fsp.readdir(bigDir).catch(() => [])) await fsp.unlink(path.join(bigDir, name)).catch(() => {});
+    await store.loadFromDisk();
+    gcNow();
+    const bigBase = heapMB();
+    for (let i = 0; i < 200; i += 1) {
+      // 必须深拷贝：浅拷贝会让 200 个任务共享同一个 artifacts 引用，
+      // 测出来的「常驻内存」会假得离谱（真实任务各自持有自己的正文）。
+      const clone = JSON.parse(JSON.stringify(bigTemplate));
+      clone.id = `job_big${String(i).padStart(5, '0')}${'f'.repeat(8)}`;
+      clone.goal = `大交付物基准 ${i}`;
+      await store.saveJob(clone);
+      seen.push(clone.id);
+    }
+    gcNow();
+    const bigHeap = heapMB();
+    table(
+      ['口径', '任务数', '单任务 JSON', '内存缓存', 'heapUsed'],
+      [
+        ['小任务（前面口径）', '200', '25 KB', '200 个', retainHeap.toFixed(1) + ' MB'],
+        ['大交付物任务', '200', `${(oneBig / 1024).toFixed(0)} KB`, `${await store.countJobs()} 个`, bigHeap.toFixed(1) + ' MB'],
+      ],
+    );
+    const bigPerJobHeapKB = ((bigHeap - bigBase) / 200) * 1024;
+    metric({
+      section: '内存',
+      name: `200 个「${(oneBig / 1024).toFixed(0)} KB 级」任务常驻内存`,
+      value: `+${(bigHeap - bigBase).toFixed(1)} MB`,
+      verdict: bigHeap - bigBase < 64 ? OK : bigHeap - bigBase < 192 ? WARN : BAD,
+      basis: `实测 ${bigPerJobHeapKB.toFixed(0)} KB 堆/任务（约为其 UTF-8 JSON 体积的 ${(bigPerJobHeapKB / (oneBig / 1024)).toFixed(1)} 倍）；json-store.js:20 MAX_MEMORY_JOBS=200 → 500KB 级任务约 ${((bigPerJobHeapKB * 2.8 * 200) / 1024).toFixed(0)} MB 常驻上限`,
+    });
+    note('结论：内存压力不是「泄漏了一条」，而是「所有历史任务都留在内存里，且单任务有多大就留多大」。');
+
+    /* 释放检验：删掉全部任务后内存能不能回落（证明增长确实是这些结构占的） */
+    for (const id of seen) {
+      await httpJson(`${base}/api/jobs/${id}`, { method: 'DELETE' });
+    }
+    dropAll(seen);
+    store.resetStore();
+    await store.loadFromDisk();
+    gcNow();
+    const released = heapMB();
+    metric({
+      section: '内存',
+      name: '全部删除后内存是否回落（释放检验）',
+      value: `${bigHeap.toFixed(1)} MB → ${released.toFixed(1)} MB`,
+      verdict: released < bigBase + 12 ? OK : WARN,
+      basis: '证明前面的增长确实是「保留的任务 + events 日志」占的，不是 V8 碎片；也说明唯一有效的回收手段是用户主动删任务',
+    });
+    seen.length = 0;
 
     /* --- 1.3 真实（非演示）任务的事件日志规模 --- */
     const realIds = [];
@@ -682,10 +812,10 @@ async function benchMemory() {
     });
     metric({
       section: '内存',
-      name: 'json-store 内存缓存上限（常驻风险）',
-      value: `200 个任务 × ${(perRealJobFile / 1024).toFixed(0)} KB ≈ ${((perRealJobFile * 200) / 1048576).toFixed(0)} MB`,
-      verdict: (perRealJobFile * 200) / 1048576 < 64 ? OK : (perRealJobFile * 200) / 1048576 < 256 ? WARN : BAD,
-      basis: 'json-store.js:20 MAX_MEMORY_JOBS=200，缓存里存的是**带交付物正文的完整 job**；500KB 级任务 → 100MB 常驻',
+      name: 'json-store 内存缓存上限（存的是完整正文）',
+      value: `实测 200 × ${(oneBig / 1024).toFixed(0)} KB = +${(bigHeap - bigBase).toFixed(0)} MB`,
+      verdict: bigHeap - bigBase < 64 ? OK : bigHeap - bigBase < 192 ? WARN : BAD,
+      basis: 'json-store.js:20 MAX_MEMORY_JOBS=200，缓存里存的是**带交付物正文的完整 job**；这块内存不会因为「任务跑完」而释放',
     });
     dropAll(realIds);
 
@@ -852,6 +982,125 @@ async function benchLatency() {
     void smallBefore;
     dropAll(created);
     dropAll(manyIds);
+
+    /* --- /api/health 为什么比别的端点慢：每次请求都同步开 sqlite --- */
+    const providers = await import(path.join(ROOT, 'src/llm/providers.js'));
+    const chain = providers.DEFAULT_CHAIN;
+    const timeIt = async (fn, n = 50) => {
+      for (let i = 0; i < 5; i += 1) fn();
+      const t = process.hrtime.bigint();
+      for (let i = 0; i < n; i += 1) fn();
+      return ms(t) / n;
+    };
+    const withSqlite = await timeIt(() => providers.inspectChain(chain));
+    const withoutSqlite = await timeIt(() => providers.inspectChain(chain, { explicitKey: 'bench-key' }));
+    const healthOnly = results.find((r) => r.ep.name === 'GET /api/health').s;
+    table(
+      ['调用方式', '单次耗时', '说明'],
+      [
+        ['inspectChain()——本机没配 Key，会去读 Cherry Studio', fmtMs(withSqlite), '5 个 provider × 每次同步打开 12.8MB 的 sqlite'],
+        ['inspectChain()——显式给 Key，跳过 sqlite', fmtMs(withoutSqlite), '同样的逻辑，只是不走磁盘'],
+        ['GET /api/health（含上面那次调用）', fmtMs(healthOnly.p50), '中间件 + JSON 序列化'],
+      ],
+    );
+    note(`Cherry Studio 配置库存在：${fs.existsSync(path.join(os.homedir(), 'Library/Application Support/CherryStudio/Data/cherrystudio.sqlite'))}；环境变量里没有 API Key，所以走的是「零配置读本机」这条路。`);
+    metric({
+      section: '延迟',
+      name: '/api/health 里同步 sqlite 的代价',
+      value: `${fmtMs(withSqlite)} vs ${fmtMs(withoutSqlite)}`,
+      verdict: withSqlite < 5 ? OK : withSqlite < 30 ? WARN : BAD,
+      basis: 'providers.js:139 inspectChain → resolveKey → keyFromCherryStudio:74；用 node:sqlite 的 DatabaseSync，**同步阻塞事件循环**，每次请求最多开 5 次',
+    });
+    metric({
+      section: '延迟',
+      name: '/api/templates 是否缓存模板',
+      value: `p50 ${fmtMs(results.find((r) => r.ep.name.includes('templates')).s.p50)}（每次读 8 个文件）`,
+      verdict: results.find((r) => r.ep.name.includes('templates')).s.p50 < 20 ? OK : WARN,
+      basis: 'server.js:113 loadTemplates 每次请求都 readdir + 逐个 readFile + JSON.parse；模板是只读的，进程内缓存一次就够',
+    });
+
+    /* --- 2b. 同时开 10 个任务：这才是「一个人用」的真实强度 --- */
+    section('2b. 同时开 10 个任务（同一台机器、同一个进程）');
+    await installDemo(FAST_DEMO ? DEMO_STEP_MS_FAST : DEMO_STEP_MS_REAL);
+    const { callModel: benchModel } = makeScriptedModel({ perArtifactChars: 3000 });
+    const singleSamples = [];
+    const soloIds = [];
+    const soloOriginal = engine.deps.callModel;
+    engine.deps.callModel = benchModel;
+    try {
+      // 单任务基准（同一条流水线，串行跑一遍）
+      for (let i = 0; i < 3; i += 1) {
+        const t = process.hrtime.bigint();
+        const c = await postJson(base, '/api/jobs', { goal: `单任务基准 ${i}` });
+        soloIds.push(c.body.job.id);
+        await waitJob(base, c.body.job.id);
+        singleSamples.push(ms(t));
+      }
+      const soloMs = stats(singleSamples).p50;
+
+      // 10 个任务同时提交
+      const CONCURRENT = 10;
+      const t0 = process.hrtime.bigint();
+      const posts = await Promise.all(
+        Array.from({ length: CONCURRENT }, (_, i) => postJson(base, '/api/jobs', { goal: `并发基准 ${i}` })),
+      );
+      const ids = posts.map((p) => p.body.job.id);
+      created.push(...ids);
+
+      // 趁着 10 条流水线在跑，量「用户点一下列表/详情要等多久」
+      const during = [];
+      let settled = 0;
+      const deadline = Date.now() + 60_000;
+      while (settled < CONCURRENT && Date.now() < deadline) {
+        const t = process.hrtime.bigint();
+        const r = await httpJson(`${base}/api/jobs`);
+        const listMs = ms(t);
+        const t2 = process.hrtime.bigint();
+        await httpJson(`${base}/api/jobs/${ids[0]}`);
+        during.push({ list: listMs, detail: ms(t2) });
+        const snap = await httpJson(`${base}/api/jobs`);
+        settled = (snap.body.jobs ?? []).filter((j) => ids.includes(j.id) && ['done', 'failed', 'cancelled'].includes(j.status)).length;
+        void r;
+        await new Promise((r2) => setTimeout(r2, 15));
+      }
+      const totalMs = ms(t0);
+      await Promise.all(ids.map((id) => waitJob(base, id, { timeoutMs: 60_000 })));
+      const listDuring = stats(during.map((d) => d.list));
+      const detailDuring = stats(during.map((d) => d.detail));
+
+      table(
+        ['口径', '任务数', '总耗时', '单任务平均', '期间 GET /api/jobs p95', '期间 GET /api/jobs/:id p95'],
+        [
+          ['串行（一次一个）', '1', fmtMs(soloMs), fmtMs(soloMs), '—', '—'],
+          [
+            `并发`,
+            String(CONCURRENT),
+            fmtMs(totalMs),
+            fmtMs(totalMs / CONCURRENT),
+            fmtMs(listDuring.p95),
+            fmtMs(detailDuring.p95),
+          ],
+        ],
+      );
+      metric({
+        section: '延迟',
+        name: `同时跑 ${CONCURRENT} 个任务：整批耗时 / 单任务平均`,
+        value: `${fmtMs(totalMs)} / ${fmtMs(totalMs / CONCURRENT)}`,
+        verdict: totalMs / CONCURRENT < soloMs * 3 ? OK : totalMs / CONCURRENT < soloMs * 8 ? WARN : BAD,
+        basis: `串行单任务实测 ${fmtMs(soloMs)}；并发后单任务平均耗时涨到几倍就是「同时开多个任务会卡」的直接证据（这是**产品问题清单里的第 1 条**）`,
+      });
+      metric({
+        section: '延迟',
+        name: `${CONCURRENT} 个任务在跑时，页面请求的 p95 延迟`,
+        value: `列表 ${fmtMs(listDuring.p95)} / 详情 ${fmtMs(detailDuring.p95)}`,
+        verdict: listDuring.p95 < 300 && detailDuring.p95 < 300 ? OK : WARN,
+        basis: '流水线跑起来后用户还在点页面；这里测的是「后台任务会不会把界面拖卡」',
+      });
+      note(`并发窗口内共采样 ${during.length} 次（每次同时打列表与详情）。`);
+    } finally {
+      engine.deps.callModel = soloOriginal;
+      dropAll(soloIds);
+    }
   } finally {
     await closeApp({ server });
   }
@@ -962,14 +1211,14 @@ async function benchDisk() {
     );
     metric({
       section: '磁盘',
-      name: `约 500KB 任务的单次全量写盘（实测 ${(bigSize / 1024).toFixed(0)} KB）`,
+      name: `大任务（${(bigSize / 1024).toFixed(0)} KB）单次全量写盘`,
       value: fmtMs(bs.p50),
       verdict: bs.p50 < 20 ? OK : bs.p50 < 60 ? WARN : BAD,
       basis: '这个体积的项目每次 save 都要重新序列化 + fsync 整个文件；一个任务 save 20+ 次 → 写放大数十倍',
     });
     metric({
       section: '磁盘',
-      name: '500KB 任务整任务理论写入量',
+      name: `大任务整任务理论写入量`,
       value: `≈ ${((bigSize * saves) / 1048576).toFixed(1)} MB`,
       verdict: (bigSize * saves) / 1048576 < 8 ? OK : (bigSize * saves) / 1048576 < 32 ? WARN : BAD,
       basis: `按实测 ${saves} 次 saveJob 推算；对 SSD 寿命和「任务跑完时磁盘忙」都有影响`,
@@ -977,30 +1226,59 @@ async function benchDisk() {
 
     /* --- 3.3 sweepTmpFiles 竞态：会删掉正在写的临时文件，让任务失败 --- */
     section('3b. 持久化竞态：sweepTmpFiles 删掉正在写的 .tmp');
-    const raceJob = { ...bigJob, id: 'job_' + 'c'.repeat(16) };
-    const p = store.saveJob(raceJob);
-    await new Promise((r) => setTimeout(r, 3));
-    const tmpBefore = fs.readdirSync(path.join(DATA_DIR, 'jobs')).filter((n) => n.endsWith('.tmp'));
-    const swept = await store.sweepTmpFiles();
-    let raceErr = null;
-    try {
-      await p;
-    } catch (e) {
-      raceErr = e;
+    const jobsDir = path.join(DATA_DIR, 'jobs');
+    const listTmp = () => fs.readdirSync(jobsDir).filter((n) => n.endsWith('.tmp'));
+
+    /**
+     * 复现步骤（确定性，不靠运气）：
+     *   起一个**大**任务（写入窗口足够宽）→ 轮询等它的 .tmp 出现 → 立刻 sweepTmpFiles() → 看这次 save 的结局。
+     * 为什么要大任务：小任务的 JSON.stringify + 写盘只有几毫秒，
+     * 定时器回调经常在 .tmp 出现之前/之后才被调度，会假阴性。
+     */
+    async function reproSweepRace(attempt = 0) {
+      const raceJob = JSON.parse(JSON.stringify(bigJob));
+      raceJob.id = 'job_' + String(attempt).repeat(16).slice(0, 16).replace(/[^a-z0-9]/g, 'c');
+      raceJob.id = `job_c${String(attempt).padStart(15, '0')}`;
+      raceJob.artifacts = raceJob.artifacts.map((a, i) => ({ ...a, content: filler(180_000, `race${attempt}${i}`) }));
+      const p = store.saveJob(raceJob);
+      let tmpBefore = [];
+      for (let i = 0; i < 400; i += 1) {
+        tmpBefore = listTmp();
+        if (tmpBefore.length) break;
+        await new Promise((r) => setTimeout(r, 1));
+      }
+      if (!tmpBefore.length) {
+        await p.catch(() => {});
+        await store.deleteJob(raceJob.id);
+        return { tmpBefore, swept: 0, err: null, missed: true };
+      }
+      const swept = await store.sweepTmpFiles();
+      let err = null;
+      try {
+        await p;
+      } catch (e) {
+        err = e;
+      }
+      await store.deleteJob(raceJob.id).catch(() => {});
+      return { tmpBefore, swept, err, missed: false };
     }
+
+    let race = await reproSweepRace(0);
+    for (let a = 1; a < 3 && race.missed && !race.err; a += 1) race = await reproSweepRace(a);
+
     table(
       ['步骤', '观测'],
       [
-        ['saveJob 进行中的 .tmp', tmpBefore.join(', ') || '(无)'],
-        ['sweepTmpFiles() 删掉的文件数', String(swept)],
-        ['saveJob 的结局', raceErr ? `${raceErr.code}: ${String(raceErr.message).slice(0, 70)}…` : '成功'],
+        ['saveJob 进行中的 .tmp', race.tmpBefore.join(', ') || '(没抓到，见依据)'],
+        ['sweepTmpFiles() 删掉的文件数', String(race.swept)],
+        ['saveJob 的结局', race.err ? `${race.err.code}: ${String(race.err.message).slice(0, 70)}…` : '成功'],
       ],
     );
     metric({
       section: '磁盘',
       name: 'sweepTmpFiles() 是否会删掉并发写入的 .tmp',
-      value: raceErr ? `会（${raceErr.code}）` : '不会',
-      verdict: raceErr ? BAD : OK,
+      value: race.err ? `会（${race.err.code}）` : '不会',
+      verdict: race.err ? BAD : OK,
       basis: 'json-store.js:135 无条件 unlink 所有 *.json.tmp；调用点 json-store.js:230（loadFromDisk 每次 force 重载都会跑）→ startSyncTimer 每 30s 一次',
     });
 
@@ -1053,18 +1331,19 @@ async function benchDisk() {
     const RACE_N = 50;
     const trials = [];
     for (const interval of [30, 100, 300, 1000]) {
-      const b = await raceTrial(interval, RACE_N);
-      trials.push({ interval, ...b });
+      // 30ms 那一档命中率最敏感（取决于定时器相位），多跑一倍样本，别让结论落在噪声上
+      const b = await raceTrial(interval, interval === 30 ? RACE_N * 2 : RACE_N);
+      trials.push({ interval, n: interval === 30 ? RACE_N * 2 : RACE_N, ...b });
     }
     table(
       ['同步周期（真实值 30000ms）', '任务数', 'done', '因 ENOENT 失败', '其他失败', '失败率'],
       trials.map((t) => [
         `${t.interval} ms`,
-        String(RACE_N),
+        String(t.n),
         String(t.ok),
         String(t.enoent),
         String(t.other),
-        `${((t.enoent / RACE_N) * 100).toFixed(0)} %`,
+        `${((t.enoent / t.n) * 100).toFixed(0)} %`,
       ]),
     );
     if (trials[0].examples[0]) note(`服务端真实日志（节选）：${trials[0].examples[0]}`);
@@ -1076,9 +1355,9 @@ async function benchDisk() {
     metric({
       section: '磁盘',
       name: '同步与写盘竞态导致的真实任务失败（周期 30ms 实测）',
-      value: `${trials[0].enoent}/${RACE_N}（${((trials[0].enoent / RACE_N) * 100).toFixed(0)} %）`,
+      value: `${trials[0].enoent}/${trials[0].n}（${((trials[0].enoent / trials[0].n) * 100).toFixed(0)} %）`,
       verdict: trials[0].enoent === 0 ? OK : BAD,
-      basis: '机制 100% 是 json-store.js:135 sweepTmpFiles 无条件删 .tmp；用户看到的是「新建任务」直接 500，或任务跑到一半莫名失败',
+      basis: '机制 100% 是 json-store.js:135 sweepTmpFiles 无条件删 .tmp；用户看到的是「新建任务」直接 500，或任务跑到一半莫名失败。同一档重复跑会因定时器相位浮动（实测 8%~28%），量级稳定',
     });
     metric({
       section: '磁盘',
@@ -1220,18 +1499,24 @@ async function benchSse() {
     const frames = sessions.map((s) => s.frames);
 
     // 让所有连接同时收到一条广播，量「一条事件到 50 个客户端的延迟」
+    const before = sessions.map((s) => s.frames);
     const tBroadcast = process.hrtime.bigint();
     events.publish(id, { type: 'log', stageId: null, level: 'info', text: 'SSE 基准广播', at: Date.now() });
-    const before = sessions.map((s) => s.frames);
-    await new Promise((r) => setTimeout(r, 200));
+    let broadcastMs = 0;
+    for (;;) {
+      const got = sessions.filter((s, i) => s.frames > before[i]).length;
+      if (got === CONNS) break;
+      if (ms(tBroadcast) > 3000) break;
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    broadcastMs = ms(tBroadcast);
     const delivered = sessions.filter((s, i) => s.frames > before[i]).length;
-    const broadcastMs = ms(tBroadcast);
 
     gcNow();
     const heapDuring = heapMB();
 
     await Promise.all(sessions.map(sseClose));
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 500)); // 给 undici 连接池一点时间回收
     const listenersAfter = events.listenerCount(id);
     gcNow();
     const heapAfter = heapMB();
@@ -1244,7 +1529,7 @@ async function benchSse() {
         ['补发帧数（每条连接）', frames[0] === frames[frames.length - 1] ? String(frames[0]) : `${Math.min(...frames)}~${Math.max(...frames)}`],
         ['建立期间的 SSE 监听器数', String(listenersDuring)],
         ['断开后的 SSE 监听器数', String(listenersAfter)],
-        ['50 条连接额外占用的堆', fmtMB(heapDuring - heapBefore)],
+        ['50 条连接额外占用的堆（客户端+服务端同进程）', fmtMB(heapDuring - heapBefore)],
         ['断开后回收', fmtMB(heapDuring - heapAfter)],
         ['一条广播送达 50 个客户端的耗时', fmtMs(broadcastMs)],
         ['收到广播的客户端数', `${delivered}/${CONNS}`],
@@ -1273,10 +1558,10 @@ async function benchSse() {
     });
     metric({
       section: 'SSE',
-      name: `${CONNS} 条连接的额外堆占用`,
+      name: `${CONNS} 条连接的额外堆占用（含基准脚本自己的客户端）`,
       value: fmtMB(heapDuring - heapBefore),
-      verdict: heapDuring - heapBefore < 8 ? OK : WARN,
-      basis: `每条连接一个监听器 + 一个 15s 心跳定时器；${CONNS} × 3 个标签页仍在本机可承受范围`,
+      verdict: heapDuring - heapBefore < 16 ? OK : WARN,
+      basis: `每条连接一个监听器 + 一个 15s 心跳定时器；这里客户端和服务端在同一个进程里，所以含 undici 连接池与 50 个读缓冲，是**上界**`,
     });
     note(`连接期间事件日志条数 ${events.since(id, 0).length}（每个连接都要把这段补发一遍）`);
     void job;
@@ -1397,31 +1682,82 @@ async function benchCrash() {
       ],
     );
 
-    const stuck = statusAfter === 'running';
+    const stuck = statusAfter === 'running' || statusAfter === 'queued';
+    const stageRecovered = (after.body?.job?.stages ?? []).some((x) => x.status === 'failed');
     metric({
       section: '崩溃',
       name: 'kill -9 后重启，未完成任务的状态',
-      value: `${statusAfter}${statusAfter === 'running' ? '（永远卡住）' : ''}`,
+      value: `${statusAfter}${stuck ? '（永远卡住）' : '（已恢复）'}`,
       verdict: stuck ? BAD : OK,
-      basis: '启动时没有任何代码把 running 改成 interrupted/failed（grep 全仓无此逻辑）；running 的 Map 是纯内存的，重启即丢',
+      basis: 'server.js:298 markInterruptedJobs()：启动时把 running/queued 标成 failed + code=INTERRUPTED + 一句人话；实测这条件路径是通的',
     });
     metric({
       section: '崩溃',
-      name: '重启后用户打开这个页面的体感',
-      value: `SSE ${sseFrames} 帧，无任何进度`,
-      verdict: sseFrames <= 1 ? BAD : OK,
-      basis: '事件日志也在内存里（events.js #logs），重启即空 → 补发 0 条，只剩心跳；界面会永远显示「运行中」',
+      name: '恢复后用户看到的错误文案与重试入口',
+      value: `${after.body?.job?.error?.code ?? 'n/a'}`,
+      verdict: after.body?.job?.error?.code === 'INTERRUPTED' ? OK : WARN,
+      basis: '普通人需要的是「发生了什么 + 我能做什么」，而不是一个永远转圈的进度条；这条已经是可用状态',
     });
     metric({
       section: '崩溃',
-      name: '任务卡在 running 时的可恢复性',
-      value: after.body?.job?.stages?.some((x) => x.status === 'running') ? '需要用户手动点「重试」' : 'n/a',
-      verdict: stuck ? WARN : OK,
-      basis: 'POST /api/jobs/:id/retry 可用（没有 failed 阶段时会从 intake 整条重跑），但界面不会主动提示，普通用户不会知道',
+      name: '重启后 SSE 能补发多少历史进度',
+      value: `${sseFrames} 帧 / ${sseBytes} 字节`,
+      verdict: sseFrames <= 1 ? WARN : OK,
+      basis: '事件日志是纯内存的（events.js:14 #logs），重启即空 —— 任务状态保住了，但「谁做了什么、花了多久」这条时间线没了',
     });
+    metric({
+      section: '崩溃',
+      name: '被中断的阶段是否留下痕迹（stage.status=failed）',
+      value: stageRecovered ? '有' : `无（stages=${(after.body?.job?.stages ?? []).length} 条）`,
+      verdict: stageRecovered ? OK : WARN,
+      basis: 'markInterruptedJobs 会把 stages 里 running 的那个标成 failed；演示模式下 stages 要到流水线结束才落盘，所以中断时是空的 —— 真实任务会好一些',
+    });
+    metric({
+      section: '崩溃',
+      name: '中断任务重启后能否手动重试',
+      value: after.body?.job?.stages?.some((x) => x.status === 'failed') ? '可（从失败阶段续跑）' : '可（从 intake 整条重跑）',
+      verdict: OK,
+      basis: 'engine.js:1092 retryJob：有 failed 阶段就从它续跑，否则从 intake 重来；产物不会被清空',
+    });
+
+    /* --- 真实任务形状（有 stages、其中一个是 running）的恢复路径 --- */
+    const realRecovered = JSON.parse(JSON.stringify(onDisk));
+    realRecovered.id = 'job_' + 'a'.repeat(16);
+    realRecovered.status = 'running';
+    realRecovered.stages = [
+      { id: 's1', key: 'intake', title: '理解需求', role: '接待员', status: 'done', log: [], output: null, error: null },
+      { id: 's2', key: 'plan', title: '制定方案', role: '项目经理', status: 'done', log: [], output: null, error: null },
+      { id: 's3', key: 'draft', title: '动手做', role: '执行专员', status: 'running', startedAt: Date.now() - 5000, log: [], output: null, error: null },
+      { id: 's4', key: 'verify', title: '验收', role: '质检员', status: 'pending', log: [], output: null, error: null },
+    ];
+    realRecovered.artifacts = [{ id: 'art_1', deliverableId: 'd1', name: '已完成的初稿', format: 'markdown', content: 'x'.repeat(200), createdAt: Date.now() }];
+    await store.saveJob(realRecovered);
+    const marked = await markInterruptedJobs();
+    const recovered = await store.getJob(realRecovered.id);
+    const draftStage = recovered.stages.find((s) => s.key === 'draft');
+    table(
+      ['真实任务形状', '恢复结果'],
+      [
+        ['job.status running → ', String(recovered.status)],
+        ['draft 阶段 running → ', `${draftStage.status}${draftStage.error ? ` (${draftStage.error.code})` : ''}`],
+        ['已完成产物是否保留', `${recovered.artifacts.length} 份，${recovered.artifacts[0]?.content.length} 字符`],
+        ['markInterruptedJobs() 处理数', String(marked)],
+      ],
+    );
+    metric({
+      section: '崩溃',
+      name: '真实任务（8 阶段、有 running 阶段）的恢复质量',
+      value: `${recovered.status} / draft=${draftStage.status}`,
+      verdict: recovered.status === 'failed' && draftStage.status === 'failed' ? OK : WARN,
+      basis: '已完成的阶段与产物原样保留，只有正在跑的那个阶段被判失败 —— 这就是「用户不该白跑」的正确行为',
+    });
+    await store.deleteJob(realRecovered.id);
   } finally {
     for (const c of [child, child2]) {
-      if (c && c.exitCode === null) {
+      // 被信号杀掉的进程 exitCode 也是 null（signalCode 才有值），
+      // 只判断 exitCode 会对着一个已经死掉的进程等 'exit' 事件 —— 基准会挂死。
+      const alive = c && c.exitCode === null && c.signalCode === null;
+      if (alive) {
         c.kill('SIGKILL');
         await new Promise((r) => c.once('exit', r));
       }
@@ -1474,7 +1810,10 @@ async function main() {
 
   console.log('');
   console.log('\x1b[1m交接 Handoff — 性能与可靠性基准（S10）\x1b[0m');
+  const fp = sourceFingerprint();
   console.log(`  Node ${process.version} · 平台 ${process.platform}/${process.arch} · 版本 ${VERSION}`);
+  console.log(`  被测源码 git ${fp.rev}${fp.dirty ? '（src/ 有未提交改动）' : ''}`);
+  console.log(`  ${fp.hashes}`);
   console.log(`  数据目录 ${DATA_DIR}（临时，结束即删）`);
   console.log(`  GC ${global.gc ? '已启用（--expose-gc）' : '未启用 —— 堆数字会偏高'}`);
   console.log(`  演示节奏 ${FAST_DEMO ? '加速（0ms/阶段，仅影响进度条间隔）' : '真实（700ms/阶段）'}`);

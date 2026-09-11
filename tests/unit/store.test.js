@@ -231,10 +231,34 @@ describe('原子写与崩溃恢复', () => {
     expect(await store.listJobs(50)).toEqual([]);
   });
 
-  it('sweepTmpFiles 清掉上次崩溃留下的 .tmp', async () => {
-    await fs.writeFile(path.join(jobsDir(), 'job_aaaaaaaaaaaaaaaa.json.tmp'), 'half', 'utf8');
+  it('sweepTmpFiles 只清「陈旧」的 .tmp，绝不碰正在写的那个', async () => {
+    // ⚠️ 这条测试保护的是一个会**让用户任务直接失败**的 bug：
+    // sweepTmpFiles 每 30 秒被 loadFromDisk({force:true}) 调用一次，
+    // 而无条件删除会把 atomicWrite **正在写**的临时文件删掉，
+    // 随后 rename 报 ENOENT → 用户的「新建任务」直接 500。
+    // 性能工程师实测：100 个任务里 7 个失败（把同步周期压到 30ms 时）。
+    const fresh = path.join(jobsDir(), 'job_aaaaaaaaaaaaaaaa.json.123.1.tmp');
+    await fs.writeFile(fresh, 'half', 'utf8');
+
+    // 刚写出来的（正在写的）→ 一个都不许删
+    expect(await store.sweepTmpFiles()).toBe(0);
+    expect((await fs.readdir(jobsDir())).filter((n) => n.endsWith('.tmp'))).toHaveLength(1);
+
+    // 把它改成 10 分钟前的 → 这时候才算真残渣，才该清掉
+    const old = Date.now() - 10 * 60 * 1000;
+    await fs.utimes(fresh, new Date(old), new Date(old));
     expect(await store.sweepTmpFiles()).toBe(1);
     expect((await fs.readdir(jobsDir())).filter((n) => n.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('临时文件名唯一化：同一文件的两次写入不会互相覆盖', async () => {
+    // 固定名 `${file}.tmp` 是上面那个 bug 的另一半原因：并发写同一个 job 时
+    // 两个写者会抢同一个临时文件名。这里通过"写两次都能成功且最终内容正确"来钉住。
+    const job = makeJob();
+    await store.saveJob(job);
+    await Promise.all([store.saveJob({ ...job, tone: 'formal' }), store.saveJob({ ...job, tone: 'simple' })]);
+    const final = await store.getJob(job.id);
+    expect(['formal', 'simple']).toContain(final.tone);
   });
 });
 
