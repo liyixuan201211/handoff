@@ -251,6 +251,43 @@ function extractJsonObject(text) {
  */
 const timeoutFor = (key) => STAGE_TIMEOUT_MS[key] ?? 120000;
 
+/**
+ * 交付阶段的兜底：不靠模型，用**已有的真实信息**拼一份「怎么用」。
+ *
+ * 触发条件：模型在最后一步失败（超时/格式不对）。这时候用户要的成果已经做完了，
+ * 我们绝不能因为"说明没写成"就把整个任务标成失败 ——
+ * 那会让用户以为白等了，而东西其实就在旁边。
+ *
+ * 拼出来的内容全部来自 plan（标题、假设、风险）和 artifacts（名字），
+ * 都是真实数据，不是编的。
+ * @param {object} ctx 阶段上下文
+ * @param {Error} err 原始错误（只用来记日志，不展示给用户）
+ */
+function synthesizeDelivery(ctx, err) {
+  const plan = ctx.plan ?? {};
+  const names = (ctx.artifacts ?? []).map((a) => a.name).filter(Boolean);
+  const risks = plan.risks ?? [];
+  return {
+    headline: plan.title ? `${plan.title}：东西已经做好了` : '东西已经做好了',
+    howToUse: [
+      names.length
+        ? `先看成果里的这几份：${names.join('、')}。`
+        : '先看下面列出的成果。',
+      (plan.assumptions ?? []).length
+        ? '再看「我们替你做的假设」那一栏 —— 里面任何一条不对，都值得你补一句让我们重做。'
+        : '如果哪一部分不对，在下面补一句话，我们会重做。',
+      '想拿走的话，每份成果右上角都有复制和下载。',
+    ],
+    nextSteps: [
+      '把成果里标为"必须做"的部分先落实。',
+      risks.length ? `特别留意这一条：${risks[0]}` : '有拿不准的地方，把具体情况补进来再让我们看一遍。',
+    ],
+    cautions: risks.slice(1, 3).map((r) => `别忘了：${r}`),
+    _fallback: true,
+    _reason: err?.code ?? 'unknown',
+  };
+}
+
 export const STAGE_RUNNERS = {
   async intake(ctx) {
     const out = await ctx.callModel({
@@ -397,7 +434,13 @@ export const STAGE_RUNNERS = {
   },
 
   async deliver(ctx) {
-    const out = await ctx.callModel({
+    // ⚠️ 交付说明是**整条流水线的最后一步**，而用户真正要的东西这时候已经做好了。
+    // 如果模型在这一步掉链子（超时、格式不对），绝不能因此把整个任务判为失败 ——
+    // 那等于告诉用户「你等了 8 分钟，什么都没有」，而其实成果就躺在旁边。
+    // 所以这里兜底：拿不到模型写的说明，就用我们自己拼的（内容来自 plan，全是真实数据）。
+    let out;
+    try {
+      out = await ctx.callModel({
       timeoutMs: timeoutFor('deliver'),
       system: systemPromptFor('deliver'),
       user: buildUser.deliver({
@@ -411,7 +454,11 @@ export const STAGE_RUNNERS = {
       purpose: 'deliver',
       role: TEAM.deliver.role,
       temperature: 0.5,
-    });
+      });
+    } catch (err) {
+      ctx.log('交付说明这一步没写成，我用现成的信息替你拼一份。', 'warn');
+      out = synthesizeDelivery(ctx, err);
+    }
     ctx.log(`交付说明写好了：${out.headline}`);
     return out;
   },
