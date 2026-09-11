@@ -63,10 +63,35 @@ const unsubscribe = events.subscribe(job.id, (e) => {
 // 等待结束
 const DEADLINE_MS = Number(process.env.HANDOFF_DRYRUN_DEADLINE_MS) || 20 * 60 * 1000;
 let final = null;
+// 接待员偶尔会反问（默认策略是"先做、把假设亮出来"，但真的缺关键信息时会问）。
+// 真实用户会在界面上回答，所以干跑脚本也要**扮演这个用户** ——
+// 否则我们测的就不是"完整的一条路"，而是"半条路"。
+// 这是脚本的职责，不是产品的缺陷：产品在这一步的行为是对的（停下来问，而不是瞎猜）。
+let answered = false;
 while (Date.now() - t0 < DEADLINE_MS) {
   await new Promise((r) => setTimeout(r, 500));
   const cur = await getJob(job.id);
-  if (cur && ['done', 'failed', 'cancelled', 'awaiting_input'].includes(cur.status)) {
+
+  if (cur && cur.status === 'awaiting_input' && !answered) {
+    answered = true;
+    const questions = (cur.clarifyQuestions ?? []).join(' / ');
+    log(`  ❓ 接待员想确认：${questions}`);
+    log('  💬 我（作为用户）回答：我手上有合同原文，只给了你摘要。请按摘要先给出风险清单和应对动作，'
+      + '并在交付物里提醒我拿原文逐条核对。我是租客，还没签字，最担心押金要不回来。');
+    try {
+      const { sendMessage } = await import('../src/pipeline/engine.js');
+      await sendMessage(
+        job.id,
+        '我手上有合同原文，只是这次只给了你摘要。请先按摘要给出风险清单和具体应对动作，'
+        + '并在交付物里提醒我拿原文逐条核对。我是租客，还没签字，最担心押金要不回来。',
+      );
+    } catch (err) {
+      log(`  ⚠️ 回答没能提交：${err.code || err.message}`);
+    }
+    continue;
+  }
+
+  if (cur && ['done', 'failed', 'cancelled'].includes(cur.status)) {
     final = cur;
     break;
   }
