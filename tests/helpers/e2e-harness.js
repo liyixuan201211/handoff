@@ -133,6 +133,46 @@ const mockResult = (json, purpose) => ({
  * @param {string[]} [opts.deliverableIds]
  * @returns {{callModel:Function, calls:Array, purposes:()=>string[]}}
  */
+/**
+ * 按「阶段」取剧本产出的公开入口。
+ *
+ * 为什么需要它：e2e 里要替换的是 HTTP 传输（stub fetch），而不是 callModel。
+ * 那种写法下必须自己从请求体判断"这是哪个阶段"，然后给出对应的剧本返回值。
+ * 这个判断曾经被做错两次（截断 + 顺序敏感的内容词），所以把"判定"这一步
+ * 收进这里统一实现，测试里只调用它，别再各自写一套匹配逻辑。
+ *
+ * 判定依据：每个阶段的 system 提示词都以「你是这家 AI 公司的**岗位名**。」开头。
+ *
+ * @param {object} body 请求体（已 JSON.parse）
+ * @returns {string} 阶段 key，识别不出返回 'unknown'
+ */
+export function stageOfRequest(body) {
+  const sysText = String(
+    (body?.messages ?? []).find((m) => m.role === 'system')?.content ?? '',
+  );
+  const ROLE_TO_STAGE = {
+    接待员: 'intake',
+    项目经理: 'plan',
+    调研员: 'research',
+    执行专员: 'draft', // 同时用于 draft/revise，下面再细分
+    审查员: 'critique',
+    质检员: 'verify',
+    交付专员: 'deliver',
+  };
+  for (const [role, key] of Object.entries(ROLE_TO_STAGE)) {
+    if (sysText.startsWith(`你是这家 AI 公司的**${role}**`)) {
+      // revise 的岗位名也是"执行专员"，靠提示词里的另一句特征区分
+      return key === 'draft' && sysText.includes('现在负责**改稿**') ? 'revise' : key;
+    }
+  }
+  return 'unknown';
+}
+
+/** 取某个阶段的剧本产出（给 stub fetch 用） */
+export function scriptedOutputFor(stage, opts = {}) {
+  return stageOutputs(opts)[stage] ?? null;
+}
+
 export function scriptedModel(opts = {}) {
   const { failPurposes = [], failAfter = null, confidence = 'high', deliverableIds = ['d1', 'd2'] } = opts;
   const outputs = stageOutputs({ confidence, deliverableIds });

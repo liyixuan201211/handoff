@@ -573,21 +573,66 @@ async function execute(job) {
       job.stages.find((s) => s.key === key) ?? makeStageRecord(key, reasons.get(key), undefined);
     if (!job.stages.includes(stage)) job.stages.push(stage);
 
-    const out = await runOneStage({
-      job,
-      stage,
-      key,
-      outputs,
-      artifacts,
-      callModel: callModelWithAccounting,
-      emit,
-      checkAbort,
-      save,
-      signal,
-      onArtifacts: (next) => {
-        artifacts = next;
-      },
-    });
+    // ── 可选阶段失败要「降级」，不要「终止」────────────────────
+    //
+    // critique（挑毛病）和 revise（改稿）是**锦上添花**的阶段：
+    // 它们失败时，用户真正要的 draft 产物**已经做好了**。
+    // 但如果让异常冒出去，整个任务就会变成 failed —— 用户等了几分钟，
+    // 明明有东西却什么都拿不到。这个交换明显不划算。
+    //
+    // 所以：可选阶段失败 → 标记 skipped、记一条用户看得懂的日志、继续往下走，
+    // 由 verify（必需）去做最后的质量把关。
+    let out;
+    try {
+      out = await runOneStage({
+        job,
+        stage,
+        key,
+        outputs,
+        artifacts,
+        callModel: callModelWithAccounting,
+        emit,
+        checkAbort,
+        save,
+        signal,
+        onArtifacts: (next) => {
+          artifacts = next;
+        },
+      });
+    } catch (err) {
+      const isOptional = !STAGE_META[key]?.required;
+      const isAbort = err?.code === ERR.LLM_ABORTED || err?.code === ERR.PIPELINE_CANCELLED;
+      if (!isOptional || isAbort) throw err;
+
+      stage.status = 'skipped';
+      stage.endedAt = Date.now();
+      stage.ms = stage.endedAt - stage.startedAt;
+      stage.error = { code: err?.code ?? 'INTERNAL_ERROR', message: redactSecrets(err?.message ?? '') };
+      stage.log.push({
+        at: Date.now(),
+        level: 'warn',
+        text: `这一步没能做完（${err?.code ?? '未知原因'}），跳过它继续 —— 已经做好的东西不受影响。`,
+      });
+      job.updatedAt = Date.now();
+      await save(job);
+      emit({
+        type: 'stage',
+        stageId: stage.id,
+        status: 'skipped',
+        title: stage.title,
+        role: stage.role,
+        ms: stage.ms,
+        key,
+      });
+      emit({
+        type: 'log',
+        stageId: stage.id,
+        level: 'warn',
+        text: `「${stage.title}」这一步没做成，已跳过。你的成果不会因此丢掉。`,
+        at: Date.now(),
+      });
+      continue;
+    }
     outputs[key] = out;
 
     // 各阶段产出的落地

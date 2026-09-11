@@ -30,6 +30,8 @@ import {
   waitForJob,
   memoryJob,
   runDemoJobViaHttp,
+  stageOfRequest,
+  scriptedOutputFor,
 } from '../helpers/e2e-harness.js';
 import { createApp } from '../../src/server.js';
 
@@ -346,9 +348,13 @@ describe('C. 失败与边界（最容易出 bug 的地方）', () => {
     }
   });
 
-  it('模型全失败（第 5 阶段挂）→ job failed，但前面已完成的交付物必须保留', async () => {
-    // 这里走**真实网关**（只把 HTTP 传输换掉），让 critique 阶段所有 provider 都返回 400。
-    // 400 是不可重试的，网关会立刻换下一个 provider —— 5 个 provider 全挂 → 该阶段失败。
+  it('必需阶段全失败 → job failed，但前面已完成的交付物必须保留', async () => {
+    // 这里走**真实网关**（只把 HTTP 传输换掉），让 **verify**（必需阶段）所有 provider 都返回 400。
+    // 400 是不可重试的，网关会立刻换下一个 provider —— 链上全挂 → 该阶段失败。
+    //
+    // ⚠️ 为什么打 verify 而不是 critique：critique/revise 是**可选**阶段，
+    // 它们失败时引擎会降级跳过（见 engine.js 里那段"可选阶段失败要降级不要终止"的注释），
+    // 任务会继续跑到 done。要测"彻底失败时的行为"，必须打一个**必需**阶段。
     // 用真实网关而不是假 callModel，是因为引擎的模型层最近在重构，
     // 「假 callModel 的返回形状」很容易过时（我就被这个坑了一次）。
     const realKeys = { aiping: process.env.AIPING_API_KEY, deepseek: process.env.DEEPSEEK_API_KEY };
@@ -356,27 +362,18 @@ describe('C. 失败与边界（最容易出 bug 的地方）', () => {
     process.env.DEEPSEEK_API_KEY = 'sk-test-0000000000000000';
 
     const outputs = (await import('../helpers/e2e-harness.js')).stageOutputs();
-    let critiqueCalls = 0;
+    let verifyCalls = 0;
     const fakeFetch = async (url, init) => {
       const body = JSON.parse(init.body);
-      const head = (body.messages?.[0]?.content ?? '').slice(0, 120);
-      const stage =
-        head.includes('改稿') ? 'revise'
-          : head.includes('做出来') ? 'draft'
-            : head.includes('项目经理') ? 'plan'
-              : head.includes('接待员') ? 'intake'
-                : head.includes('调研员') ? 'research'
-                  : head.includes('审查员') ? 'critique'
-                    : head.includes('质检员') ? 'verify'
-                      : 'deliver';
+      const stage = stageOfRequest(body);
 
-      if (stage === 'critique') {
-        critiqueCalls += 1;
+      if (stage === 'verify') {
+        verifyCalls += 1;
         return {
           ok: false,
           status: 400,
           async text() {
-            return '上游拒绝了这次请求（剧本：让第 5 个阶段彻底失败）';
+            return '上游拒绝了这次请求（剧本：让必需阶段彻底失败）';
           },
           async json() {
             return { error: 'bad request' };
@@ -411,20 +408,19 @@ describe('C. 失败与边界（最容易出 bug 的地方）', () => {
       if (realKeys.deepseek === undefined) delete process.env.DEEPSEEK_API_KEY;
       else process.env.DEEPSEEK_API_KEY = realKeys.deepseek;
     }
-    expect(critiqueCalls).toBeGreaterThanOrEqual(1); // 确实打到了 critique
+    expect(verifyCalls).toBeGreaterThanOrEqual(1); // 确实打到了 verify
 
     // 1) 整个任务失败
     expect(job.status).toBe('failed');
     expect(job.error).not.toBeNull();
 
-    // 2) 失败发生在第 5 个阶段，前面 4 个阶段都成功了
-    expect(job.stages.find((s) => s.key === 'critique').status).toBe('failed');
-    expect(job.stages.filter((s) => s.status === 'done').map((s) => s.key)).toEqual([
-      'intake',
-      'plan',
-      'research',
-      'draft',
-    ]);
+    // 2) verify 失败，但它前面的阶段（含可选的 critique/revise）不该被牵连
+    const verify = job.stages.find((s) => s.key === 'verify');
+    expect(verify.status).toBe('failed');
+    const doneKeys = job.stages.filter((s) => s.status === 'done').map((s) => s.key);
+    expect(doneKeys).toContain('intake');
+    expect(doneKeys).toContain('plan');
+    expect(doneKeys).toContain('draft');
 
     // 3) draft 已经产出的交付物必须还在（用户不该白跑）
     expect(job.artifacts.length).toBeGreaterThanOrEqual(1);
@@ -662,16 +658,7 @@ describe('C. 失败与边界（最容易出 bug 的地方）', () => {
     const outputs = (await import('../helpers/e2e-harness.js')).stageOutputs({ confidence: '0.95' });
     const fakeFetch = async (url, init) => {
       const body = JSON.parse(init.body);
-      const head = (body.messages?.[0]?.content ?? '').slice(0, 120);
-      const stage =
-        head.includes('改稿') ? 'revise'
-          : head.includes('做出来') ? 'draft'
-            : head.includes('项目经理') ? 'plan'
-              : head.includes('接待员') ? 'intake'
-                : head.includes('调研员') ? 'research'
-                  : head.includes('审查员') ? 'critique'
-                    : head.includes('质检员') ? 'verify'
-                      : 'deliver';
+      const stage = stageOfRequest(body);
       return {
         ok: true,
         status: 200,
@@ -704,4 +691,67 @@ describe('C. 失败与边界（最容易出 bug 的地方）', () => {
     expect(memoryJob('job_not_exist')).toBeNull();
     expect(fs.existsSync(dataDir)).toBe(true);
   });
+});
+
+/* ================================================================== *
+ * 可选阶段降级（这一条保护的是"用户等了几分钟却什么都没拿到"）
+ *
+ * critique（挑毛病）和 revise（改稿）是锦上添花：它们失败时，
+ * 用户真正要的 draft 产物**已经做好了**。
+ * 如果让异常冒出去，整个任务会变成 failed —— 明明有东西却拿不到。
+ * 这个交换明显不划算，所以引擎让可选阶段降级为 skipped 并继续往下走。
+ * ================================================================== */
+describe('可选阶段降级：critique / revise 失败不能让整个任务失败', () => {
+  it('critique 全挂 → critique 标记 skipped，任务继续跑到 done', async () => {
+    const realKeys = { aiping: process.env.AIPING_API_KEY, deepseek: process.env.DEEPSEEK_API_KEY };
+    process.env.AIPING_API_KEY = 'sk-test-0000000000000000';
+    process.env.DEEPSEEK_API_KEY = 'sk-test-0000000000000000';
+    const outputs = (await import('../helpers/e2e-harness.js')).stageOutputs();
+    let critiqueCalls = 0;
+    const fakeFetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      if (stageOfRequest(body) === 'critique') {
+        critiqueCalls += 1;
+        return {
+          ok: false, status: 400,
+          async text() { return '剧本：让可选阶段彻底失败'; },
+          async json() { return { error: 'bad request' }; },
+        };
+      }
+      // 按阶段给出对应的剧本产出（不要再自己写一套匹配逻辑，见 harness 里的注释）
+      const payload = scriptedOutputFor(stageOfRequest(body)) ?? outputs.intake;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [{ message: { role: 'assistant', content: JSON.stringify(payload) }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 100, completion_tokens: 50 },
+          };
+        },
+      };
+    };
+    vi.stubGlobal('fetch', fakeFetch);
+    let job;
+    try {
+      const created = await request(app).post('/api/jobs').send({ goal: '可选阶段降级测试' });
+      expect(created.status).toBe(201);
+      job = await waitForJob(app, created.body.job.id, { timeoutMs: 60_000, intervalMs: 100 });
+    } finally {
+      vi.unstubAllGlobals();
+      if (realKeys.aiping === undefined) delete process.env.AIPING_API_KEY;
+      else process.env.AIPING_API_KEY = realKeys.aiping;
+      if (realKeys.deepseek === undefined) delete process.env.DEEPSEEK_API_KEY;
+      else process.env.DEEPSEEK_API_KEY = realKeys.deepseek;
+    }
+
+    expect(critiqueCalls).toBeGreaterThanOrEqual(1);
+    const critique = job.stages.find((s) => s.key === 'critique');
+    expect(critique.status).toBe('skipped');
+    // 关键：任务没失败，而且交付物在
+    expect(job.status).toBe('done');
+    expect(job.artifacts.length).toBeGreaterThanOrEqual(1);
+    // 用户能看到"这一步跳过了"，而不是一脸问号
+    expect(critique.log.map((l) => l.text).join(' ')).toMatch(/跳过|没做成/);
+  }, 90_000);
 });
