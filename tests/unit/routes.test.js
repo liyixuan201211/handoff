@@ -211,14 +211,23 @@ describe('列表与详情', () => {
     expect(res.body.jobs).toHaveLength(50);
   });
 
-  it('GET /api/jobs/:id 返回全量（含 stage 日志），但不含交付物正文', async () => {
+  it('GET /api/jobs/:id 返回全量（含 stage 日志与交付物正文）', async () => {
     const job = await store.saveJob(makeJob());
     const res = await request(app).get(`/api/jobs/${job.id}`);
     expect(res.status).toBe(200);
     expect(res.body.job.stages[0].log[0].text).toBe('收到需求');
     expect(res.body.job.artifacts[0].name).toBe('风险清单');
-    expect(res.body.job.artifacts[0].content).toBeUndefined();
-    expect(res.body.job.artifacts[0].bytes).toBeGreaterThan(80);
+    // 契约 §2：详情接口的 artifacts[].content 是必填。
+    // 曾经为了"减小响应体积"剥掉了它，实测后果是**已完成的任务打开后交付物空白** —— 
+    // 因为前端的加载顺序是「先 GET 快照渲染 → 再接 SSE 增量」，快照里没有正文就渲染不出东西。
+    expect(typeof res.body.job.artifacts[0].content).toBe('string');
+    expect(res.body.job.artifacts[0].content.length).toBeGreaterThan(80);
+    // 下载端点必须给出**同一份**内容，两条路径不能有任何差异
+    const dl = await request(app).get(
+      `/api/jobs/${job.id}/artifacts/${res.body.job.artifacts[0].id}/download`,
+    );
+    expect(dl.status).toBe(200);
+    expect(dl.text).toBe(res.body.job.artifacts[0].content);
   });
 
   it('不存在的 id → 404', async () => {
@@ -418,6 +427,66 @@ describe('SSE 流', () => {
     expect(events.listenerCount(jobId)).toBe(0);
   });
 
+
+  it('客户端断开时释放监听器与心跳定时器（绝不泄漏）', async () => {
+    const http = await import('node:http');
+    const app = createApp({ rateLimit: false });
+    const job = await store.saveJob(makeJob());
+    const server = app.listen(0, '127.0.0.1');
+    await new Promise((r) => server.once('listening', r));
+    const port = server.address().port;
+
+    const { statusCode, headers } = await new Promise((resolve, reject) => {
+      const req = http.get(
+        { host: '127.0.0.1', port, path: `/api/jobs/${job.id}/stream`, headers: { Accept: 'text/event-stream' } },
+        (res) => {
+          res.once('data', () => resolve({ statusCode: res.statusCode, headers: res.headers }));
+          res.on('error', () => {});
+        },
+      );
+      req.on('error', reject);
+      // 拿到首块数据后由断言逻辑断开
+      setTimeout(() => reject(new Error('SSE 首块数据超时')), 3000).unref?.();
+      globalThis.__sseReq = req;
+    });
+
+    expect(statusCode).toBe(200);
+    expect(headers['content-type']).toContain('text/event-stream');
+    expect(events.listenerCount(job.id)).toBe(1);
+
+    // 模拟关掉浏览器标签页
+    globalThis.__sseReq.destroy();
+    delete globalThis.__sseReq;
+    await new Promise((r) => setTimeout(r, 80));
+
+    expect(events.listenerCount(job.id)).toBe(0);
+    events.publish(job.id, { type: 'job', job: { id: job.id } });
+    expect(events.listenerCount(job.id)).toBe(0);
+    await new Promise((r) => server.close(r));
+  });
+
+  it('断线重连：带 Last-Event-ID 只补发之后的事件，不重复', async () => {
+    const { sseHandler } = await import('../../src/util/sse.js');
+    const jobId = newId('job');
+    for (let i = 1; i <= 5; i += 1) events.publish(jobId, { type: 'log', stageId: 's', level: 'info', text: `第 ${i} 条` });
+
+    const written = [];
+    const fakeReq = { query: {}, headers: { 'last-event-id': '3' }, on() {}, off() {} };
+    const fakeRes = {
+      setHeader() {}, status() { return this; }, flushHeaders() {}, flush() {},
+      write(c) { written.push(c); }, on() {}, off() {},
+    };
+    const cleanup = sseHandler({ jobId, req: fakeReq, res: fakeRes });
+    const out = written.join('');
+    expect(out).toContain('id: 4');
+    expect(out).toContain('id: 5');
+    expect(out).not.toContain('id: 1');
+    expect(out).not.toContain('id: 3');
+    expect(out).toContain(': connected');
+    cleanup();
+    expect(events.listenerCount(jobId)).toBe(0);
+  });
+
   it('?since= 与 Last-Event-ID 取较大者，只补发之后的事件', async () => {
     const { resolveSince } = await import('../../src/util/sse.js');
     expect(resolveSince({ query: { since: '5' }, headers: { 'last-event-id': '3' } })).toBe(5);
@@ -476,14 +545,26 @@ describe('限流', () => {
   it('窗口过期后恢复（注入可控时钟）', async () => {
     let now = 1_000_000;
     const limiter = createRateLimiter({ rules: RATE_RULES, now: () => now });
-    const app = createApp({ rateLimit: false });
-    app.use(limiter);
+    const app = createApp({ limiter });
     const send = () => request(app).post('/api/jobs').send({ goal: 'x' });
-    for (let i = 0; i < 10; i += 1) await send();
+    for (let i = 0; i < 10; i += 1) expect((await send()).status).toBe(201);
     expect((await send()).status).toBe(429);
     now += 61_000;
     expect((await send()).status).toBe(201);
     limiter.dispose();
+  });
+
+  it('限流按 IP + 规则分桶，且不信任伪造的 X-Forwarded-For', async () => {
+    const app = createApp();
+    for (let i = 0; i < 10; i += 1) {
+      await request(app).post('/api/jobs').set('X-Forwarded-For', `10.0.0.${i}`).send({ goal: 'x' });
+    }
+    const keys = [...app.locals.rateLimiter.hits.keys()];
+    // 只有一把钥匙：伪造的 XFF 没有生效（trust proxy=false）
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).toMatch(/^createJob\|/);
+    expect((await request(app).post('/api/jobs').send({ goal: 'x' })).status).toBe(429);
+    app.locals.rateLimiter.dispose();
   });
 });
 
@@ -563,5 +644,24 @@ describe('服务装配', () => {
     const app = createApp({ rateLimit: false });
     expect(typeof app.listen).toBe('function');
     expect(app.locals.rateLimiter).toBeNull();
+  });
+});
+
+/* ================================================================== */
+describe('创建后立即可读（持久化兜底）', () => {
+  it('POST 返回的 job 一定能被 GET /api/jobs/:id 读到（即使 engine 没自己落盘）', async () => {
+    const app = createApp({ rateLimit: false });
+    // 模拟 engine 只返回对象、不落盘的情况
+    engine.startJob.mockImplementationOnce(async (input) => makeJob({ goal: input.goal, status: 'queued' }));
+    const created = await request(app).post('/api/jobs').send({ goal: '帮我做个学习计划' });
+    expect(created.status).toBe(201);
+    const id = created.body.job.id;
+
+    const detail = await request(app).get(`/api/jobs/${id}`);
+    expect(detail.status).toBe(200);
+    expect(detail.body.job.id).toBe(id);
+
+    // 真的写到磁盘了（服务重启也在）
+    await expect(fs.access(path.join(jobsDir(), `${id}.json`))).resolves.toBeUndefined();
   });
 });

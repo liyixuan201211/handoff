@@ -103,21 +103,23 @@ describe('基本读写', () => {
 
     const got = await store.getJob(b.id);
     expect(got.goal).toBe('B');
+    expect(await store.countJobs()).toBe(3);
 
-    // saveJob 会用写入时刻刷新 updatedAt（这是我们要的语义：最近动过的排前面），
-    // 这里把时间戳固定下来，专门验证排序规则。
-    const stamp = (id, t) =>
-      store.updateJob(id, (j) => {
-        j.updatedAt = t;
-      });
-    await stamp(c.id, 2000);
-    await stamp(a.id, 1000);
-    await stamp(b.id, 3000);
+    // saveJob 会用「写入时刻」刷新 updatedAt（这是想要的语义：最近动过的排前面）。
+    // 排序规则本身在这里用固定时间戳单独验证：直接改盘再重新加载。
+    const stamp = (job, t) => {
+      job.updatedAt = t;
+      return fs.writeFile(path.join(jobsDir(), `${job.id}.json`), JSON.stringify(job), 'utf8');
+    };
+    await stamp(c, 2000);
+    await stamp(a, 1000);
+    await stamp(b, 3000);
+    store.resetStore();
+    await store.loadFromDisk();
 
     const list = await store.listJobs(50);
     expect(list.map((j) => j.goal)).toEqual(['B', 'C', 'A']);
     expect(list).toHaveLength(3);
-    expect(await store.countJobs()).toBe(3);
   });
 
   it('listJobs 尊重 limit，且默认 50', async () => {

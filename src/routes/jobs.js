@@ -176,14 +176,48 @@ function artifactMeta(a) {
   };
 }
 
-/** 全量 job（去掉交付物正文，正文走下载接口，避免 detail 响应几 MB） */
+/**
+ * 完整交付物（详情页用）。
+ *
+ * ⚠️ 这里必须带 `content`。CONTRACT.md §2 的 Job 形状里 `artifacts[].content` 是**必填**，
+ * 而前端的加载顺序是「先 GET 快照渲染 → 再接 SSE 增量」。如果快照里没有正文，
+ * 用户打开一个已完成的任务会看到**空白交付物** —— 这是最伤信任的一种 bug。
+ * （曾经为了"避免响应几 MB"剥掉了 content，那是错的：本产品的交付物是几千字 markdown，
+ *   不是二进制大文件，一次几万字完全在合理范围内。）
+ */
+function artifactFull(a) {
+  return {
+    id: a.id,
+    deliverableId: a.deliverableId ?? null,
+    name: a.name,
+    format: a.format ?? 'markdown',
+    content: typeof a.content === 'string' ? a.content : '',
+    assumptions: Array.isArray(a.assumptions) ? a.assumptions : [],
+    confidence: a.confidence ?? null,
+    basedOn: Array.isArray(a.basedOn) ? a.basedOn : [],
+    createdAt: a.createdAt ?? null,
+  };
+}
+
+/** 全量 job（交付物带正文，前端拿到即可直接渲染） */
 export function publicJob(job) {
+  if (!job || typeof job !== 'object') return null;
+  return {
+    ...job,
+    artifacts: Array.isArray(job.artifacts) ? job.artifacts.map(artifactFull) : [],
+  };
+}
+
+/** 列表页用的轻量摘要（不带正文，避免 50 条任务的响应过大） */
+export function summaryJob(job) {
   if (!job || typeof job !== 'object') return null;
   return {
     ...job,
     artifacts: Array.isArray(job.artifacts) ? job.artifacts.map(artifactMeta) : [],
   };
 }
+
+
 
 /* ------------------------------------------------------------------ */
 /* 路由                                                                */
@@ -212,6 +246,16 @@ export function createJobsRouter() {
       const job = await startJob(input); // 只等「建起来」，不等「跑完」
       if (!job || typeof job.id !== 'string') {
         throw new AppError(ERR.PIPELINE_STAGE_FAILED, '任务创建失败，请重试一次。', { status: 500 });
+      }
+      // 兜底持久化：只要 job 已经返回给客户端，就必须能从 GET /api/jobs/:id 读到。
+      // 正常情况下 engine 自己会 saveJob（这里是幂等覆盖），但持久化是「刷新页面还在」
+      // 这个承诺的底座，不能依赖调用方的实现细节。
+      if (!(await store.getJob(job.id))) {
+        try {
+          await store.saveJob(job);
+        } catch (err) {
+          console.warn(`[routes/jobs] 兜底持久化失败（不影响本次响应）：${err.message}`);
+        }
       }
       res.status(201).json({ job: publicJob(job) });
     } catch (err) {
@@ -245,7 +289,12 @@ export function createJobsRouter() {
     try {
       const job = await loadJobOr404(req.params.id, res);
       if (!job) return;
-      const text = requireMessageText(req.body?.text);
+      // ⚠️ 字段名兼容：契约 §2 写的是 `{ text }`，但前端实现发的是 `{ message }`（api.js）。
+      // 两边不一致 → 追加要求/回答澄清 **100% 返回 400**，核心交互直接不可用。
+      // 这类"文档说 A、代码发 B"的偏差**单测发现不了**（两边各自的测试都绿），
+      // 只有端到端真跑一次才会暴露。所以这里两个名字都收，并在 e2e 补了回归断言。
+      const raw = req.body?.text ?? req.body?.message;
+      const text = requireMessageText(raw);
       await sendMessage(job.id, text);
       const fresh = (await store.getJob(job.id)) ?? job;
       res.json({ ok: true, job: publicJob(fresh) });

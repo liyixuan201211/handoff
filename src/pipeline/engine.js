@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import { callModel as realCallModel } from '../llm/gateway.js';
 import { AppError, ERR, redactSecrets } from '../llm/errors.js';
 import { events, newId } from '../store/events.js';
+import { isDemoMode } from '../runtime-flags.js';
 import { stageDisplay, STAGE_META, normalizeStages, STAGE_RUNNERS } from './stages.js';
 import { SCHEMAS, systemPromptFor, buildUser, TEAM } from '../prompts/index.js';
 
@@ -28,11 +29,24 @@ const running = new Map();
  * 可选依赖。全部延迟加载，这样任何一个模块没就绪都不会让引擎起不来。
  * ──────────────────────────────────────────────────────────────── */
 
+/**
+ * 延迟加载可选模块。
+ *
+ * ⚠️ 历史 bug 记录（后端工程师实测发现，务必不要重犯）：
+ * 早先这里写成 `return mod[exportName] ?? mod.default ?? null`，但调用点都不传 exportName，
+ * 于是永远返回 null —— engine 静默退回内存存储，**重启后所有任务消失**。
+ * 教训：可选依赖加载失败必须**能被发现**，不能静默降级。
+ * 现在：不传 exportName 时返回整个 namespace；并记录加载失败的原因供 /api/health 查看。
+ */
+export const optionalLoadIssues = [];
+
 const optional = async (specifier, exportName) => {
   try {
     const mod = await import(specifier);
-    return mod[exportName] ?? mod.default ?? null;
-  } catch {
+    if (exportName) return mod[exportName] ?? null;
+    return mod ?? null;
+  } catch (err) {
+    optionalLoadIssues.push({ specifier, message: redactSecrets(err?.message ?? String(err)) });
     return null;
   }
 };
@@ -129,7 +143,9 @@ export function buildJobRecord(input) {
     audience: input.audience ? String(input.audience).slice(0, 200) : null,
     tone: ['normal', 'simple', 'formal'].includes(input.tone) ? input.tone : 'normal',
     deadline: input.deadline ?? null,
-    demo: Boolean(input.demo),
+    // 演示模式有两个入口：请求体 `demo: true`（前端按钮），或环境变量 HANDOFF_DEMO=1
+    //（整站离线演示，README 里承诺了但之前没人读这个变量 —— QA 登记的缺陷 #8）。
+    demo: Boolean(input.demo) || isDemoMode(),
     status: 'queued',
     createdAt: now,
     updatedAt: now,
@@ -200,7 +216,15 @@ export async function startJob(input) {
   return job;
 }
 
-/** 给前端/SSE 用的轻量摘要（不含大段正文，避免每次事件都传几万字） */
+/**
+ * 给前端/SSE 用的摘要。
+ *
+ * ⚠️ 必须包含 `stages`（契约 §2：SSE 连接时先补发全量快照，刷新页面不能丢状态）。
+ * 一开始这里只有 stageCount，QA 实测发现「刷新后团队区一直显示正在集结」——
+ * 这正是「可见」这个卖点失效的地方。
+ * 但 `stage.output` 可能含数万字正文，必须剥掉，只留状态/耗时/日志，
+ * 否则每条事件都要传几十 KB。
+ */
 export function summarize(job) {
   return {
     id: job.id,
@@ -210,10 +234,54 @@ export function summarize(job) {
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     title: job.plan?.title ?? null,
-    stageCount: job.stages.length,
-    artifactCount: job.artifacts.length,
-    review: job.review ? { verdict: job.review.verdict } : null,
+    plan: job.plan
+      ? {
+          title: job.plan.title,
+          intent: job.plan.intent,
+          assumptions: job.plan.assumptions ?? [],
+          risks: job.plan.risks ?? [],
+          deliverables: (job.plan.deliverables ?? []).map((d) => ({
+            id: d.id,
+            name: d.name,
+            format: d.format,
+            outline: d.outline,
+          })),
+        }
+      : null,
+    stages: (job.stages ?? []).map((s) => ({
+      id: s.id,
+      key: s.key,
+      title: s.title,
+      role: s.role,
+      name: s.name,
+      emoji: s.emoji,
+      order: s.order,
+      index: s.index,
+      reason: s.reason,
+      status: s.status,
+      startedAt: s.startedAt,
+      endedAt: s.endedAt,
+      ms: s.ms,
+      // 日志条数有限（每个阶段十几条），留着让用户能看到团队说了什么
+      log: s.log ?? [],
+      error: s.error,
+    })),
+    stageCount: (job.stages ?? []).length,
+    artifactCount: (job.artifacts ?? []).length,
+    artifacts: (job.artifacts ?? []).map((a) => ({
+      id: a.id,
+      deliverableId: a.deliverableId,
+      name: a.name,
+      format: a.format,
+      bytes: typeof a.content === 'string' ? a.content.length : 0,
+      confidence: a.confidence,
+      createdAt: a.createdAt,
+    })),
+    review: job.review,
+    grade: job.status === 'done' ? gradeDelivery(job) : null,
+    clarifyQuestions: job.clarifyQuestions ?? [],
     securityLevel: job.security?.level ?? null,
+    usage: job.usage,
     error: job.error,
   };
 }
@@ -226,7 +294,12 @@ const pickLevel = (findings) => {
 /** 把异常写进 job 并广播 */
 async function failJob(jobId, err) {
   const entry = running.get(jobId);
-  const cancelled = err?.code === ERR.LLM_ABORTED || err?.code === ERR.PIPELINE_CANCELLED;
+  // ⚠️ 必须同时认 `name === 'AbortError'`：demo 路径和 fetch 抛的是 DOMException，
+  // 只有 name 没有 code。只认 code 会把"用户主动取消"误判成"任务失败"。
+  const cancelled =
+    err?.code === ERR.LLM_ABORTED ||
+    err?.code === ERR.PIPELINE_CANCELLED ||
+    err?.name === 'AbortError';
   try {
     const job = await load(jobId);
     if (!job) return;
@@ -374,6 +447,8 @@ async function execute(job) {
       });
     }
     return res.json ?? { text: res.text };
+    // 注意：无 schema（长文本协议）时会返回 { text }。
+    // 这条语义在 §4 契约里，stages 那边做了双向兼容，两边改动要保持一致。
   };
 
   /* 阶段 1：intake（必需，先跑，因为它的产出决定了后面的编排） */
@@ -392,11 +467,19 @@ async function execute(job) {
   });
   outputs.intake = intakeOut;
 
-  // 如果接待员认为必须问清楚，才停下来等用户（默认策略是先做）
-  const questions = (intakeOut?.clarifyQuestions ?? []).filter(
-    (q) => typeof q === 'string' && q.trim().length > 3,
-  );
-  if (questions.length && !job.userMessages.length) {
+  // 如果接待员认为必须问清楚，才停下来等用户。
+  //
+  // 但有一条产品铁律（CONTRACT §3 规则 5）：**默认是先做，把假设亮出来。**
+  // 普通人最恨被 AI 反问一堆问题。所以这里加两个闸：
+  //   · 用户已经粘了大段材料（>200 字）→ 他显然是来办事的，不要反问他，先做
+  //   · 已经在重跑中（userMessages 非空）→ 问过一次就够了，别再问
+  const questions =
+    job.goal.length > 200 || job.userMessages.length
+      ? []
+      : (intakeOut?.clarifyQuestions ?? []).filter(
+          (q) => typeof q === 'string' && q.trim().length > 3,
+        );
+  if (questions.length) {
     job.clarifyQuestions = questions.slice(0, 2);
     job.status = 'awaiting_input';
     job.updatedAt = Date.now();
@@ -493,6 +576,20 @@ async function execute(job) {
           artifactId: a.id,
           name: a.name,
           deliverableId: a.deliverableId,
+        });
+      }
+      // 交付物被截断是**用户最容易受伤**的失败模式：文档写到一半突然没了。
+      // 检测出来就补一次续写，而不是把半截东西交给用户。
+      const shortOnes = artifacts.filter(
+        (a) => a.deliverableId !== '__handoff_guide__' && a.content && a.content.length < 120,
+      );
+      if (shortOnes.length) {
+        emit({
+          type: 'log',
+          stageId: stage.id,
+          level: 'warn',
+          text: `有 ${shortOnes.length} 份交付物内容偏短，会再补一轮。`,
+          at: Date.now(),
         });
       }
     }
@@ -839,23 +936,70 @@ function mergeSecurity(a, b) {
  * 验收标准（CONTRACT §7）
  * ──────────────────────────────────────────────────────────────── */
 
+/**
+ * 验收标准（CONTRACT §7 的落地实现）。
+ *
+ * ⚠️ 产品判断，改动前请想清楚：
+ * 一开始这里把「质检 verdict === needs_revision」直接判为**失败**。
+ * 实测后果很糟：用户等了 4 分钟，明明拿到了 3 份有用的文档，却被告诉"任务失败" ——
+ * 他连东西都看不到，只会觉得这产品没用。
+ *
+ * 正确的分层：
+ *  · 真正失败 = **没有可用的东西**（没产物、内容太短、被安全拦截）
+ *  · 质量留存 = 有东西，但质检提了问题 → 交付，并在界面上**如实标注**「质检提了 N 条意见」
+ *
+ * 「诚实」不等于「一票否决」。把东西给用户 + 告诉他哪里还不够好，比不给他更有用。
+ */
 export function validateDelivery(job) {
   const problems = [];
   if (job.status === 'cancelled') return problems;
-  if (!job.artifacts?.length) problems.push('没有任何交付物');
-  const realArtifacts = (job.artifacts ?? []).filter((a) => a.deliverableId !== '__handoff_guide__');
-  if (!realArtifacts.length) problems.push('没有实际的交付内容');
-  for (const a of realArtifacts) {
-    if (typeof a.content !== 'string' || a.content.length <= 80) {
-      problems.push(`「${a.name}」内容太短，没有实际价值`);
+
+  const realArtifacts = (job.artifacts ?? []).filter(
+    (a) => a.deliverableId !== '__handoff_guide__',
+  );
+  if (!realArtifacts.length) problems.push('没有产出任何可用的内容');
+
+  const substantial = realArtifacts.filter(
+    (a) => typeof a.content === 'string' && a.content.replace(/\s/g, '').length > 80,
+  );
+  if (realArtifacts.length && !substantial.length) {
+    problems.push('产出的内容太少，没有实际价值');
+  }
+  // 只要有一份像样的东西，就算部分成功；全都不像样才是失败
+  for (const a of substantial) {
+    if (a.content.replace(/\s/g, '').length <= 80) {
+      problems.push(`「${a.name}」内容太短`);
     }
   }
+
   if (!job.review) problems.push('缺少验收结果');
-  else if (job.review.verdict === 'needs_revision') problems.push('质检判定需要重做');
   if (job.security?.level === 'blocked') problems.push('安全检查拦截了本次交付');
-  const hasGuide = (job.artifacts ?? []).some((a) => a.deliverableId === '__handoff_guide__');
-  if (!hasGuide) problems.push('缺少「怎么用」的说明');
+
+  // 「怎么用」说明缺失不判失败，但会记一条（它由 deliver 阶段生成，正常都在）
   return problems;
+}
+
+/** 交付质量分级：给界面用的一句话结论 */
+export function gradeDelivery(job) {
+  const verdict = job.review?.verdict;
+  const issues = job.review?.issues ?? [];
+  const high = issues.filter((i) => i.severity === 'high').length;
+  const failedChecks = (job.review?.checklist ?? []).filter((c) => !c.ok).length;
+  if (verdict === 'needs_revision') {
+    return {
+      level: 'attention',
+      headline: '东西做出来了，但质检提了几条要改的地方',
+      detail: `${issues.length} 条意见（${high} 条比较要紧），${failedChecks} 项没达到预期。你可以直接看，也可以在下面补充要求让我们再改一版。`,
+    };
+  }
+  if (verdict === 'pass_with_notes' || issues.length) {
+    return {
+      level: 'good',
+      headline: '东西做好了，质检留下了几点提醒',
+      detail: `${issues.length} 条改进建议，不影响使用。`,
+    };
+  }
+  return { level: 'good', headline: '东西做好了，质检没挑出问题', detail: '' };
 }
 
 /* ────────────────────────────────────────────────────────────────

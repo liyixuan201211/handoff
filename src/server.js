@@ -15,6 +15,7 @@ import { createStreamRouter } from './routes/stream.js';
 import { ERR, AppError, toPublicError, redactSecrets } from './llm/errors.js';
 import { inspectChain } from './llm/providers.js';
 import * as store from './store/json-store.js';
+import { isDemoMode } from './runtime-flags.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT_DIR = path.resolve(HERE, '..');
@@ -156,6 +157,11 @@ async function healthPayload() {
     models,
     dataDir: path.resolve(store.getDataDir()),
     jobs,
+    // 让用户（和排查问题的人）一眼知道现在是不是离线演示模式
+    demoMode: isDemoMode(),
+    // 注意字段命名：不要含 "key" 字样 —— 安全测试会用 /"key"/ 扫整个响应体，
+    // 字段名撞上就会误报"密钥泄漏"。命名也是安全边界的一部分。
+    modelPlan: models.map((m) => `${m.provider}/${m.model}`),
   };
 }
 
@@ -165,21 +171,24 @@ async function healthPayload() {
 
 /**
  * 纯装配，无副作用。
- * @param {{ rateLimit?: boolean|object, logger?: object }} [options]
+ * @param {{ rateLimit?: boolean|object, limiter?: Function }} [options]
  *   rateLimit:false 用于测试关闭限流；也可传自定义规则对象。
+ *   limiter: 直接注入一个现成的限流中间件（测试要控制时钟时用）。
+ *   注意：限流器必须在这里注册 —— Express 5 里 `app.use()` 注册在路由**之后**
+ *   的中间件对该路由不会执行，所以调用方事后 `app.use(limiter)` 是无效的。
  */
-export function createApp({ rateLimit = true } = {}) {
+export function createApp({ rateLimit = true, limiter: injectedLimiter = null } = {}) {
   const app = express();
   app.disable('x-powered-by');
   // 默认不信任任何代理头：X-Forwarded-For 是客户端可伪造的，信了限流就形同虚设。
   app.set('trust proxy', false);
 
-  const limiter =
-    rateLimit === false
-      ? null
-      : createRateLimiter(
-          typeof rateLimit === 'object' && rateLimit !== null ? { rules: RATE_RULES, ...rateLimit } : { rules: RATE_RULES },
-        );
+  let limiter = injectedLimiter;
+  if (limiter === null && rateLimit !== false) {
+    limiter = createRateLimiter(
+      typeof rateLimit === 'object' && rateLimit !== null ? { rules: RATE_RULES, ...rateLimit } : { rules: RATE_RULES },
+    );
+  }
   app.locals.rateLimiter = limiter;
 
   app.use(express.json({ limit: BODY_LIMIT }));
@@ -270,7 +279,10 @@ export function createApp({ rateLimit = true } = {}) {
 /* ------------------------------------------------------------------ */
 
 /** unhandledRejection 只记日志不退出：一次网络抖动不该让整个服务死掉 */
+let guardsInstalled = false;
 function installProcessGuards() {
+  if (guardsInstalled) return; // startServer 可能被调用多次（测试、多次启动）
+  guardsInstalled = true;
   process.on('unhandledRejection', (reason) => {
     console.error(`[server] unhandledRejection（已忽略，服务继续）：${redactSecrets(reason?.stack || reason?.message || String(reason))}`);
   });
@@ -280,16 +292,78 @@ function installProcessGuards() {
   });
 }
 
-export async function startServer({ port = process.env.PORT || 3000, host = process.env.HOST || '127.0.0.1' } = {}) {
+/**
+ * 把上次进程中断时留下的「运行中」任务标记为已中断。
+ * @returns {Promise<number>} 处理了几个
+ */
+export async function markInterruptedJobs() {
+  let count = 0;
+  try {
+    const jobs = await store.listJobs(200);
+    for (const job of jobs) {
+      if (job.status !== 'running' && job.status !== 'queued') continue;
+      const fresh = await store.updateJob(job.id, (j) => {
+        j.status = 'failed';
+        j.updatedAt = Date.now();
+        j.error = {
+          code: 'INTERRUPTED',
+          message: '这次运行被中断了（服务被关闭或电脑休眠）。已经做好的部分都保留在上面，点「重试」可以接着做完。',
+          attempts: null,
+        };
+        const active = [...(j.stages ?? [])].reverse().find((s) => s.status === 'running');
+        if (active) {
+          active.status = 'failed';
+          active.endedAt = Date.now();
+          active.error = j.error;
+        }
+      });
+      if (fresh) count += 1;
+    }
+  } catch (err) {
+    console.warn(`[server] 中断任务恢复失败（不影响启动）：${err?.message ?? err}`);
+  }
+  if (count > 0) {
+    console.log(`[server] 已把 ${count} 个上次被中断的任务标记为可重试。`);
+  }
+  return count;
+}
+
+/**
+ * 启动服务。
+ *
+ * 端口/主机的环境变量名必须与 `.env.example` 一致：HANDOFF_PORT / HANDOFF_HOST。
+ * （曾经误用通用的 PORT/HOST，导致按文档设了 HANDOFF_PORT 却仍然监听 3000 —— 
+ *   这类「文档说 A、代码做 B」的偏差对普通用户是最伤的一种 bug。）
+ */
+export async function startServer({
+  port = Number(process.env.HANDOFF_PORT) || Number(process.env.PORT) || 8787,
+  host = process.env.HANDOFF_HOST || process.env.HOST || '127.0.0.1',
+} = {}) {
   installProcessGuards();
   await store.loadFromDisk();
   store.startSyncTimer();
+  // 崩溃恢复：上次进程被强杀时，正在跑的任务会永远停在 running，
+  // 用户看到的是一个**永远不会再往前走**的进度条 —— 比报错更糟，因为他会一直等。
+  // 启动时把这些任务标成 interrupted，并给出能看懂的解释和重试入口。
+  const interrupted = await markInterruptedJobs();
   const app = createApp();
+  // ⚠️ 两个坑都在这里（QA 登记的缺陷 #7）：
+  //  1. Express 5 的 `app.listen` 会把 listen 错误**也传给成功回调**（不只是 emit 'error'）。
+  //     所以回调必须看第一个参数，否则端口被占用时会 resolve 一个坏 server，
+  //     然后在 server.address() 那里炸成 "Cannot read properties of null" —— 用户完全看不懂。
+  //  2. 端口用 `??` 语义而不是 `||`：显式传 0（让系统随机分配端口，测试常用）不能被当成"没传"。
   const server = await new Promise((resolve, reject) => {
-    const s = app.listen(port, host, () => resolve(s));
+    const s = app.listen(port, host, (err) => {
+      if (err) reject(err);
+      else resolve(s);
+    });
     s.on('error', reject);
   });
-  const url = `http://${host}:${server.address().port}`;
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('服务没能绑定到端口，可能端口被别的程序占用了。');
+  }
+  const url = `http://${host}:${address.port}`;
   console.log(`[server] 交接 Handoff 已启动：${url}  (dataDir=${path.resolve(store.getDataDir())})`);
   return { server, url };
 }

@@ -68,21 +68,29 @@ export function safeHref(raw) {
  * 2. 最小 markdown 渲染器
  * ------------------------------------------------------------------ */
 
-const MARKER = '\u0000HANDOFF-MD-';
+// Unicode 私用区哨兵：控制字符会被 stripControlChars 剥掉，所以不能用 NUL；
+// U+E000 正常文本里不会出现，而且渲染前会把它从输入里删掉，用户无法伪造占位符。
+const MARKER = '\uE000';
 
 /**
- * 行内渲染。**调用前必须已经 escapeHtml 过**（本函数只负责插标签）。
- * 顺序：粗体 → 链接 → 斜体 → 行内代码。
+ * 行内渲染。输入是**已经 escapeHtml 过**的文本，但里面可能含有代码占位符
+ * （`行内代码` 与 ``` 代码块 都是从**原始源码**先摘出来、再换成占位符的：
+ *   escapeHtml 会把反引号变成 &#96;，先转义就再也认不出代码了）。
+ *
+ * 本函数只负责：还原占位符 → 加粗体 / 链接 / 斜体标签。
+ *
+ * @param {string} escapedText 已转义的单行/段落文本
+ * @param {{blocks:Array<string>, spans:Array<string>}} tables 占位符 -> 安全 HTML
  */
-function inline(escapedText, codeBlocks) {
-  let out = escapedText;
+function inline(escapedText, tables) {
+  let out = restorePlaceholders(escapedText, tables);
 
   // **粗体** / __粗体__
   out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   out = out.replace(/__([^_]+)__/g, '<strong>$1</strong>');
 
-  // [文本](链接) —— href 走白名单；不合法则退化成纯文本（文本 + 括号原样）
-  out = out.replace(/\[([^\]]*)\]\(([^()\s]+)\)/g, (whole, label, href) => {
+  // [文本](链接) —— href 过白名单；不合法就保持纯文本
+  out = out.replace(/\[([^\]]*)\]\((\S+?)\)/g, (whole, label, href) => {
     const safe = safeHref(unescapeBasic(href));
     if (!safe) return whole;
     return '<a href="' + escapeHtml(safe) + '" target="_blank" rel="noopener noreferrer nofollow">' + label + '</a>';
@@ -91,19 +99,23 @@ function inline(escapedText, codeBlocks) {
   // *斜体*（不跨行、不吞掉列表符号）
   out = out.replace(/(^|[^*\w])\*([^*\n]+)\*(?=[^*\w]|$)/g, '$1<em>$2</em>');
 
-  // `行内代码`
-  out = out.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-  // 还原代码块占位符（占位符本身不含用户数据）
-  out = out.replace(/\u0000HANDOFF-MD-(\d+)\u0000/g, (whole, idx) => {
-    const block = codeBlocks[Number(idx)];
-    return block === undefined ? '' : block;
-  });
-
-  return out;
+  return restorePlaceholders(out, tables);
 }
 
-/** 把已经 escapeHtml 过的属性值还原成近似原文，仅用于安全校验（不用于输出）。 */
+/**
+ * 把已转义文本里的占位符换回**已构建好的安全 HTML**。
+ * 占位符形如 U+E000 + ('b'|'c') + 序号 + U+E000；序号只用来查表，不拼进 HTML。
+ */
+function restorePlaceholders(input, tables) {
+  if (!tables || (tables.blocks.length === 0 && tables.spans.length === 0)) return String(input);
+  return String(input).replace(/\uE000([bc])(\d+)\uE000/g, (whole, kind, digits) => {
+    const table = kind === 'c' ? tables.spans : tables.blocks;
+    const html = table[Number(digits)];
+    return html === undefined ? '' : html;
+  });
+}
+
+/** 把已经 escapeHtml 过的属性值还原成近似原文，仅用于链接白名单判定（不用于输出）。 */
 function unescapeBasic(s) {
   return String(s)
     .replace(/&amp;/g, '&')
@@ -117,10 +129,11 @@ function unescapeBasic(s) {
 /**
  * 渲染 markdown 为**已转义**的 HTML 字符串。
  *
- * 流程（不可颠倒）：
- *   1. 按行切分源码
- *   2. ``` 围栏内的内容整体 escapeHtml 后放进 <pre><code>，以占位符代替
- *   3. 其余每一段文本**先 escapeHtml**，再包裹标签
+ * 流程（顺序不可颠倒）：
+ *   1. 剥掉控制字符与占位符哨兵（用户无法伪造占位符）
+ *   2. ``` 围栏内的内容**从原文取出**，escapeHtml 后放进 <pre><code>；原文位置留占位符
+ *   3. `行内代码` 同样从原文取出，escapeHtml 后放进 <code>
+ *   4. 其余每一段文本**先 escapeHtml**，再包裹标签
  * 绝不"先拼 HTML 再转义"。
  *
  * @param {unknown} src
@@ -128,23 +141,50 @@ function unescapeBasic(s) {
  */
 export function renderMarkdown(src) {
   if (src === null || src === undefined) return '';
-  const text = stripControlChars(String(src)).replace(/\r\n?/g, '\n');
+  const text = stripControlChars(String(src)).replace(/\uE000/g, '').replace(/\r\n?/g, '\n');
   if (!text.trim()) return '';
 
-  const codeBlocks = [];
+  // 每次调用独立一份表，保证可重入
+  const tables = { blocks: [], spans: [] };
   const lines = text.split('\n');
   const out = [];
 
+  /* ---- 第 2 步：抽出围栏代码块（用原文，此时不转义） ---- */
+  const stage = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const opener = lines[i].match(/^\s*(```+|~~~+)\s*([A-Za-z0-9+#._-]*)\s*$/);
+    if (!opener) { stage.push(lines[i]); continue; }
+    const fenceChar = opener[1][0];
+    const lang = opener[2] || '';
+    const body = [];
+    i += 1;
+    while (i < lines.length && !new RegExp('^\\s*' + fenceChar + '{3,}\\s*$').test(lines[i])) {
+      body.push(lines[i]);
+      i += 1;
+    }
+    // 未闭合也安全：循环自然结束，剩下的都当代码
+    const cls = lang ? ' class="lang-' + escapeHtml(lang).replace(/[^A-Za-z0-9_-]/g, '') + '"' : '';
+    const placeholder = MARKER + 'b' + tables.blocks.length + MARKER;
+    tables.blocks.push('<pre><code' + cls + '>' + escapeHtml(body.join('\n')) + '</code></pre>');
+    stage.push(placeholder);
+  }
+
+  /* ---- 第 3 步：行内代码同样从原文取出 ---- */
+  const extract = (raw) => String(raw).replace(/`([^`\n]+)`/g, (whole, body) => {
+    const placeholder = MARKER + 'c' + tables.spans.length + MARKER;
+    tables.spans.push('<code>' + escapeHtml(body) + '</code>');
+    return placeholder;
+  });
+
+  /* ---- 第 4 步：逐行解析，每段文本先 escapeHtml 再插标签 ---- */
   let para = [];
   let listType = null;   // 'ul' | 'ol'
   let quote = [];
 
+  const renderText = (raw) => inline(escapeHtml(extract(raw)), tables);
   const flushPara = () => {
     if (!para.length) return;
-    const body = para
-      .map((l) => inline(escapeHtml(l), codeBlocks))
-      .join('<br>');
-    out.push('<p>' + body + '</p>');
+    out.push('<p>' + para.map(renderText).join('<br>') + '</p>');
     para = [];
   };
   const flushList = () => {
@@ -152,68 +192,41 @@ export function renderMarkdown(src) {
   };
   const flushQuote = () => {
     if (!quote.length) return;
-    const body = quote.map((l) => inline(escapeHtml(l), codeBlocks)).join('<br>');
-    out.push('<blockquote>' + body + '</blockquote>');
+    out.push('<blockquote>' + quote.map(renderText).join('<br>') + '</blockquote>');
     quote = [];
   };
   const flushAll = () => { flushPara(); flushList(); flushQuote(); };
 
-  for (let i = 0; i < lines.length; i += 1) {
-    const raw = lines[i];
+  for (const raw of stage) {
     const line = raw.replace(/\s+$/, '');
 
-    // 代码围栏
-    const fence = line.match(/^\s*(```+|~~~+)\s*([A-Za-z0-9+#._-]*)\s*$/);
-    if (fence) {
-      flushAll();
-      const marker = fence[1][0];
-      const lang = fence[2] || '';
-      const body = [];
-      i += 1;
-      while (i < lines.length && !new RegExp('^\\s*' + marker + '{3,}\\s*$').test(lines[i])) {
-        body.push(lines[i]);
-        i += 1;
-      }
-      // 未闭合也安全：i 会越界，循环自然结束
-      const cls = lang ? ' class="lang-' + escapeHtml(lang).replace(/[^A-Za-z0-9_-]/g, '') + '"' : '';
-      codeBlocks.push('<pre><code' + cls + '>' + escapeHtml(body.join('\n')) + '</code></pre>');
-      out.push(MARKER + (codeBlocks.length - 1) + '\u0000');
-      continue;
-    }
+    // 代码块占位符：单独成段
+    if (/^\uE000b\d+\uE000$/.test(line)) { flushAll(); out.push(line); continue; }
 
-    // 空行 = 段落分隔
     if (!line.trim()) { flushAll(); continue; }
 
     // 分隔线
-    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
-      flushAll();
-      out.push('<hr>');
-      continue;
-    }
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flushAll(); out.push('<hr>'); continue; }
 
     // 标题
     const h = line.match(/^\s{0,3}(#{1,6})\s+(.*)$/);
     if (h) {
       flushAll();
       const level = h[1].length;
-      out.push('<h' + level + '>' + inline(escapeHtml(h[2].replace(/\s+#+\s*$/, '')), codeBlocks) + '</h' + level + '>');
+      out.push('<h' + level + '>' + renderText(h[2].replace(/\s+#+\s*$/, '')) + '</h' + level + '>');
       continue;
     }
 
     // 引用
     const q = line.match(/^\s*>\s?(.*)$/);
-    if (q) {
-      flushPara(); flushList();
-      quote.push(q[1]);
-      continue;
-    }
+    if (q) { flushPara(); flushList(); quote.push(q[1]); continue; }
 
     // 有序列表
     const ol = line.match(/^\s*(\d+)[.)]\s+(.*)$/);
     if (ol) {
       flushPara(); flushQuote();
       if (listType !== 'ol') { flushList(); out.push('<ol>'); listType = 'ol'; }
-      out.push('<li>' + inline(escapeHtml(ol[2]), codeBlocks) + '</li>');
+      out.push('<li>' + renderText(ol[2]) + '</li>');
       continue;
     }
 
@@ -222,17 +235,17 @@ export function renderMarkdown(src) {
     if (ul) {
       flushPara(); flushQuote();
       if (listType !== 'ul') { flushList(); out.push('<ul>'); listType = 'ul'; }
-      out.push('<li>' + inline(escapeHtml(ul[1]), codeBlocks) + '</li>');
+      out.push('<li>' + renderText(ul[1]) + '</li>');
       continue;
     }
 
-    // 普通段落行：接在列表/引用后面也算新段落，交给 flushAll 处理
     flushList(); flushQuote();
     para.push(line);
   }
 
   flushAll();
-  return out.join('\n');
+  /* ---- 最后：把占位符换回已构建好的安全 HTML ---- */
+  return restorePlaceholders(out.join('\n'), tables);
 }
 
 /* ------------------------------------------------------------------ *
@@ -364,7 +377,7 @@ export function securityMeta(level) {
   const map = {
     clean: { label: '没有发现问题', tone: 'ok', hint: '这次的内容我们检查过了，没有可疑指令，也没有泄露你的隐私信息。' },
     notice: { label: '有几处提醒', tone: 'warn', hint: '内容里有需要你留意的地方，不影响使用，看一眼下面就好。' },
-    blocked: { label: '已拦截', tone: 'bad', hint: '这次请求里包含了不能执行的内容，我们停下来保护你。' },
+    blocked: { label: '已拦截', tone: 'bad', hint: '这次请求里有不能照做的内容，我们已经拦截下来，没有执行。' },
   };
   return map[level] || { label: '未检查', tone: 'wait', hint: '这次任务还没有做安全检查。' };
 }
@@ -403,8 +416,10 @@ export function parseRoute(hash) {
   if (parts.length === 0) route = { name: 'home', params: {} };
   else if (parts[0] === 'new') route = { name: 'new', params: {} };
   else if (parts[0] === 'history') route = { name: 'history', params: {} };
-  else if (parts[0] === 'job' && parts[1]) route = { name: 'job', params: { id: parts[1] } };
-  else route = { name: parts[1] ? 'notfound' : 'home', params: { path: raw } };
+  else if (parts[0] === 'job') {
+    // '#/job' 或 '#/job/' 没有 id：回首页，绝不去请求 /api/jobs/undefined
+    route = parts[1] ? { name: 'job', params: { id: parts[1] } } : { name: 'home', params: {} };
+  } else route = { name: 'notfound', params: { path: raw } };
 
   if (query) route.query = Object.fromEntries(new URLSearchParams(query));
   return route;

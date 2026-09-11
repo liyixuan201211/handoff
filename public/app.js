@@ -438,9 +438,11 @@ class JobView {
     this.flushTimer = null;
     this.ticker = null;
     this.lastLogAt = 0;
+    this.artifactText = new Map();   // artifactId -> 正文（按需从下载端点取，取到就缓存）
     this.detailKey = '';
     this.clarifyKey = '';
-    this.errorKey = '';
+    this.actionsKey = '';
+    this.badSnapshot = false;
     this.dirtyClarify = false;
     this.destroyed = false;
     this.root = this.build();
@@ -586,16 +588,28 @@ class JobView {
   async refreshSnapshot() {
     try {
       const job = await api.getJob(this.jobId);
+      // 防御：只接受本次任务自己的快照，别让串线的响应顶掉界面
+      if (!job || (job.id && job.id !== this.jobId)) return;
+      // 防御：请求返回时这个视图可能已经被销毁 / 已经被别的视图替换，
+      // 那就只更新 store 供新视图使用，绝不再碰 DOM。
       store.set({ job, jobStatus: 'ready', jobError: null });
+      if (!this.isOwner()) return;
+      this.applyJob(job, false);
     } catch (err) {
       /* 快照失败不改界面：SSE 可能还活着，保持现状比清空更友好 */
     }
+  }
+
+  /** 这个视图是否还是"当前在台上的那个"（DOM 更新只允许它来做）。 */
+  isOwner() {
+    return !this.destroyed && currentView === this;
   }
 
   /* ---------------- SSE 事件 ---------------- */
 
   onEvent(evt) {
     if (!evt || typeof evt.type !== 'string') return;
+    if (!this.isOwner()) return;   // 已经被换掉的视图不再驱动界面
     const job = this.job;
 
     if (evt.type === 'log') {
@@ -622,16 +636,25 @@ class JobView {
     }
 
     if (evt.type === 'job') {
-      // 契约：连接时先补发全量快照，再增量。合并要小心，别把本地更新的日志冲掉。
+      // 契约：连接时先补发全量快照（含完整 stages：status/role/ms/log/reason，
+      // 但 **不含 stage.output 正文、artifacts 也不含 content**），再增量推送。
+      // 合并要小心，别把本地已经收到的更细的日志冲掉。
       const incoming = evt.job || {};
-      if (incoming && Array.isArray(incoming.stages)) {
-        this.mergeJob(incoming);
+      if (!Array.isArray(incoming.stages)) return;
+      // 防御：SSE 的 job 必须就是本页订阅的这一个任务。
+      // 否则重连/串线时会把别人的任务画到当前页面（曾经真的发生过）。
+      if (incoming.id && incoming.id !== this.jobId) {
+        this.badSnapshot = true;
+        this.refreshSnapshot();   // 用权威快照纠正
+        return;
       }
+      this.badSnapshot = false;
+      this.mergeJob(incoming);
       return;
     }
 
     if (evt.type === 'artifact') {
-      // artifact 事件只带元信息，正文要回服务器取一次全量
+      // artifact 事件只带元信息（id/name/deliverableId），正文要回服务器取一次全量
       this.refreshSnapshot();
       return;
     }
@@ -680,6 +703,24 @@ class JobView {
         inc.log = mine.log || [];
       }
     });
+
+    // 交付物正文必须以"已有的那份"为准：
+    // 契约规定 SSE 的 job 快照里 artifacts[] **只有元信息（id/name/bytes），不含 content**，
+    // 而 GET /api/jobs/:id 才有正文。如果这里直接覆盖，就会把已经取到的正文冲掉
+    // （表现为：刷新后交付物变成"点一下展开看正文"）。
+    if (Array.isArray(incoming.artifacts) && incoming.artifacts.length) {
+      const localArtById = new Map();
+      (local.artifacts || []).forEach((a) => localArtById.set(a.id, a));
+      incoming.artifacts = incoming.artifacts.map((inc) => {
+        const mine = localArtById.get(inc.id);
+        if (!mine) return inc;
+        const hasInc = typeof inc.content === 'string' && inc.content.length;
+        const hasMine = typeof mine.content === 'string' && mine.content.length;
+        if (hasInc || !hasMine) return inc;
+        return Object.assign({}, inc, { content: mine.content });
+      });
+    }
+
     // 就地合并（保留 local 引用，日志数组不会被换掉）
     Object.assign(local, incoming);
     this.job = local;
@@ -702,8 +743,16 @@ class JobView {
 
   patchHead() {
     const job = this.job;
+    if (!job) { clear(this.head); this.headKey = ''; return; }
+    const headKey = [job.id, job.status, job.goal, job.updatedAt,
+      (job.plan && job.plan.intent) || '',
+      (job.plan && job.plan.title) || '',
+      (job.stages || []).length,
+      ((job.stages || []).filter((s) => s.status === 'running').length),
+    ].join('|');
+    if (headKey === this.headKey) return;
+    this.headKey = headKey;
     clear(this.head);
-    if (!job) return;
 
     const meta = statusLabel(job.status);
     this.head.appendChild(el('div', { class: 'job-head-top' }, [
@@ -894,7 +943,7 @@ class JobView {
     const job = this.job;
     if (!job) return;
     const key = JSON.stringify([
-      (job.artifacts || []).map((a) => [a.id, (a.content || '').length]),
+      (job.artifacts || []).map((a) => [a.id, (a.content || '').length, this.artifactText.has(a.id) ? 1 : 0, a.bytes || 0]),
       job.review ? [job.review.verdict, (job.review.issues || []).length] : null,
       job.security ? [job.security.level, (job.security.findings || []).length] : null,
       job.plan ? (job.plan.assumptions || []).length : 0,
@@ -923,6 +972,28 @@ class JobView {
     });
   }
 
+  /**
+   * 确保拿到交付物正文。
+   * 详情响应里通常没有 content（只有 bytes），正文在下载端点里，按需取一次并缓存。
+   * @returns {Promise<string|null>} 拿不到时返回 null，由调用方给出人话提示
+   */
+  async ensureArtifactText(art) {
+    if (!art || !art.id) return null;
+    if (this.artifactText.has(art.id)) return this.artifactText.get(art.id);
+    if (typeof art.content === 'string' && art.content.length) {
+      this.artifactText.set(art.id, art.content);
+      return art.content;
+    }
+    try {
+      const text = await api.getArtifactText(this.jobId, art.id);
+      if (typeof text !== 'string' || !text.length) return null;
+      this.artifactText.set(art.id, text);
+      return text;
+    } catch (err) {
+      return null;
+    }
+  }
+
   renderArtifacts(job) {
     const panel = this.tabPanels.get('artifact');
     clear(panel);
@@ -934,6 +1005,13 @@ class JobView {
       return;
     }
     list.forEach((art) => {
+      // 正常情况：正文随详情/事件一起来（契约 §2），**直接渲染，不要让用户多点一次**。
+      // 兜底情况：正文只在下载端点里（详情不带 content），此时才显示"展开看正文"按钮。
+      const cached = this.artifactText.get(art.id);
+      const body0 = cached !== undefined ? cached : (typeof art.content === 'string' && art.content.length ? art.content : null);
+      const knownBytes = typeof art.bytes === 'number' ? art.bytes : (body0 ? body0.length : 0);
+      const hasBody = typeof body0 === 'string';
+
       const box = el('article', { class: 'artifact', 'data-artifact-id': String(art.id || '') });
       const head = el('header', { class: 'artifact-head' }, [
         text('h3', 'artifact-name', art.name || '未命名成果'),
@@ -942,15 +1020,23 @@ class JobView {
       const actions = head.querySelector('.artifact-actions');
       const copyBtn = btn('复制', 'btn-sm');
       copyBtn.addEventListener('click', async () => {
-        const ok = await copyPlainText(art.content || '');
+        const text = await this.ensureArtifactText(art);
+        if (text === null) { toast('正文没能取到，用「下载 .md」试试'); return; }
+        const ok = await copyPlainText(text);
         toast(ok ? '已经复制好了，直接粘贴就能用' : '这个浏览器不让自动复制，请手动选中文字');
       });
       const dlBtn = btn('下载 .md', 'btn-sm');
-      dlBtn.addEventListener('click', () => {
-        triggerDownload(niceFilename(art.name, art.format), art.content || '');
+      dlBtn.addEventListener('click', async () => {
+        const text = await this.ensureArtifactText(art);
+        if (text === null) {
+          // 取不到正文就直接让浏览器走服务端下载端点
+          if (typeof window !== 'undefined') window.open(api.artifactDownloadUrl(this.jobId, art.id), '_blank', 'noopener');
+          return;
+        }
+        triggerDownload(niceFilename(art.name, art.format), text);
         toast('开始下载');
       });
-      const openBtn = btn('另存一份', 'btn-sm btn-ghost');
+      const openBtn = btn('在服务端下载', 'btn-sm btn-ghost');
       openBtn.addEventListener('click', () => {
         if (typeof window !== 'undefined') window.open(api.artifactDownloadUrl(this.jobId, art.id), '_blank', 'noopener');
       });
@@ -966,6 +1052,7 @@ class JobView {
       const meta = el('div', { class: 'artifact-meta' });
       if (art.createdAt) meta.appendChild(el('time', { class: 'chip muted mono', datetime: new Date(art.createdAt).toISOString() },
         new Date(art.createdAt).toLocaleString('zh-CN', { hour12: false })));
+      if (knownBytes) meta.appendChild(el('span', { class: 'chip mono' }, knownBytes + ' 字'));
       if (Array.isArray(art.assumptions) && art.assumptions.length) {
         meta.appendChild(el('span', { class: 'chip warn' }, '含 ' + art.assumptions.length + ' 条假设，见「我们替你做的假设」'));
       }
@@ -973,8 +1060,35 @@ class JobView {
 
       // markdown 渲染：只走 renderMarkdown()，其内部逐段 escapeHtml
       const body = el('div', { class: 'md' });
-      setRenderedMarkdown(body, art.content || '');
       box.appendChild(body);
+
+      if (hasBody) {
+        setRenderedMarkdown(body, body0);
+      } else {
+        // 正文还没到手：给一个明确的按钮，自动去取，不让用户看到空白
+        const holder = el('div', { class: 'artifact-pending' }, [
+          el('p', {}, '成果已经写好了（' + (knownBytes || 0) + ' 字），点一下展开看正文。'),
+        ]);
+        const loadBtn = btn(knownBytes ? '展开看正文' : '拉取正文', 'btn-sm btn-primary');
+        loadBtn.addEventListener('click', async () => {
+          setText(loadBtn, '正在取…');
+          loadBtn.disabled = true;
+          const text = await this.ensureArtifactText(art);
+          if (text === null) {
+            setText(loadBtn, '没取到，重试');
+            loadBtn.disabled = false;
+            toast('正文没能取到，可以点「在服务端下载」');
+            return;
+          }
+          clear(body);
+          setRenderedMarkdown(body, text);
+          holder.hidden = true;
+          this.renderArtifacts(job);   // 重建一次，让复制/下载拿到正文
+        });
+        holder.appendChild(loadBtn);
+        box.appendChild(holder);
+        box.appendChild(body);
+      }
 
       const raw = el('details', { class: 'raw' }, [
         el('summary', {}, '查看原始文字（不确定格式时用这个）'),
@@ -1096,8 +1210,18 @@ class JobView {
 
   patchActions() {
     const job = this.job;
+    if (!job) { clear(this.actionBox); this.actionsKey = ''; return; }
+
+    // 幂等：同样的状态不重建 DOM（避免重复调用把面板清空、也避免打断用户输入）
+    const key = [
+      job.status,
+      Array.isArray(job.clarifyQuestions) ? job.clarifyQuestions.join('\u0001') : '',
+      String(job.updatedAt || ''),
+      (job.error && job.error.message) || '',
+    ].join('|');
+    if (key === this.actionsKey) return;
+    this.actionsKey = key;
     clear(this.actionBox);
-    if (!job) return;
 
     if (job.status === 'awaiting_input') {
       const questions = Array.isArray(job.clarifyQuestions) ? job.clarifyQuestions : [];
@@ -1154,9 +1278,6 @@ class JobView {
     }
 
     if (job.status === 'failed') {
-      const key = String(job.updatedAt || '') + '|' + ((job.error && job.error.message) || '');
-      if (key === this.errorKey) return;
-      this.errorKey = key;
       const failedStage = (job.stages || []).find((s) => s.status === 'failed');
       const stageTitle = failedStage
         ? (failedStage.title || '') + '（' + (roleMeta(failedStage).role) + '）'
@@ -1172,7 +1293,6 @@ class JobView {
       return;
     }
 
-    this.errorKey = '';
     if (job.status === 'done') {
       this.actionBox.appendChild(el('p', { class: 'done-note' }, '任务完成了。上面的交付物可以直接复制或下载拿走。'));
     }
@@ -1181,14 +1301,16 @@ class JobView {
   async retry() {
     const job = this.job;
     if (!job) return;
+    this.actionsKey = 'retrying';
     clear(this.actionBox);
     this.actionBox.appendChild(el('p', { class: 'note', role: 'status', 'aria-live': 'polite' }, '正在让团队接着做，稍等…'));
     try {
       await api.retryJob(job.id);
-      this.errorKey = '';
       await this.refreshSnapshot();
+      this.actionsKey = '';        // 让 patchActions 按新状态重建
       this.patchActions();
     } catch (err) {
+      this.actionsKey = 'retry-failed';
       clear(this.actionBox);
       this.actionBox.appendChild(failureState({
         title: '重试没成功',
@@ -1212,16 +1334,24 @@ class JobView {
   }
 
   applyJob(job, first) {
-    this.job = job || this.job;
-    if (!this.job) {
-      // 还没拿到任务：给骨架，别给白屏
-      clear(this.head);
-      this.head.appendChild(skeleton('job'));
-      clear(this.stagesList);
-      this.stagesList.appendChild(el('li', { class: 'stage-waiting' }, '正在读取任务…'));
+    if (!job) {
+      if (!this.job) { this.renderNoJobYet(); }
       return;
     }
+    // 已经渲染过、又收到一份同样的快照（SSE 重连补发）：
+    // 契约保证它带完整 stages（status/role/ms/log/reason，但不含 stage.output），
+    // 所以直接合并即可重新对齐，不必再等一次 GET。
+    if (this.job && this.job.id === job.id) { this.mergeJob(job); return; }
+    this.job = job;
     this.patchAll(first === true);
+  }
+
+  /** 还没拿到任务：给骨架屏，别给白屏。 */
+  renderNoJobYet() {
+    clear(this.head);
+    this.head.appendChild(skeleton('job'));
+    clear(this.stagesList);
+    this.stagesList.appendChild(el('li', { class: 'stage-waiting' }, '正在读取任务…'));
   }
 }
 
@@ -1310,13 +1440,23 @@ function start() {
   store.subscribe((state) => {
     const routeKey = JSON.stringify(state.route);
     const jobsKey = state.jobsStatus + '|' + state.jobs.length;
-    if (routeKey !== lastRouteKey) return; // 路由变化由 hashchange 自己驱动
+
+    // 路由切换由 handleRoute 自己驱动渲染。这里只**记录**当前路由，
+    // 不能直接 return —— 否则后面的 jobs / job 变更会被永久挡掉。
+    if (routeKey !== lastRouteKey) {
+      lastRouteKey = routeKey;
+      return;
+    }
+
     if (jobsKey !== lastJobsKey) {
       lastJobsKey = jobsKey;
+      // 列表状态变了就重渲染历史页（骨架屏 -> 卡片 / 错误态 / 空状态）
       if (state.route.name === 'history') render();
       return;
     }
+
     // 任务详情页：不整页重渲染，交给 JobView 的局部 patch
+    // （这样用户展开的日志、正在输入的回答都不会被打断）
     if (state.route.name === 'job' && currentView) {
       currentView.applyJob(state.job, false);
     }

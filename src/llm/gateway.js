@@ -12,7 +12,7 @@
 import { AppError, ERR, redactSecrets } from './errors.js';
 import { PROVIDERS, resolveKey, resolveChain } from './providers.js';
 import { repairJson } from './json-repair.js';
-import { validate, coerceInPlace, describeEnumConstraints } from './schema-check.js';
+import { validate, coerce, describeEnumConstraints } from './schema-check.js';
 
 /** 可注入依赖，默认走真实实现 —— 测试时替换 fetch / 密钥即可 */
 const defaultDeps = {
@@ -213,7 +213,7 @@ export async function callModel(opts) {
     schema = null,
     maxTokens = 4000,
     temperature = 0.3,
-    timeoutMs = 120000,
+    timeoutMs = Number(process.env.HANDOFF_LLM_TIMEOUT_MS) || 120000,
     signal = null,
     purpose = 'generic',
     role = '',
@@ -227,12 +227,12 @@ export async function callModel(opts) {
   const deps = { ...defaultDeps, ...(opts.deps ?? {}) };
   const chain = deps.chain ?? resolveChain(deps.env);
 
-  // 把 schema 里的枚举取值直接写进提示词。实测这比任何「请严格遵守格式」都管用：
-  // 模型对**具体可选值列表**很敏感，对抽象的格式要求不敏感。
+  // 把 schema 里的**全部**硬性约束直接写进提示词。实测这比任何「请严格遵守格式」都管用：
+  // 模型对**具体字段名、具体可选取值、具体长度范围**很敏感，对抽象格式要求不敏感。
   let effectiveSystem = system;
   if (schema) {
     const constraints = describeEnumConstraints(schema);
-    effectiveSystem = `${system}\n\n<格式要求>\n只输出一个 JSON 对象，不要任何解释文字，不要 markdown 围栏。\n${constraints
+    effectiveSystem = `${system}\n\n<格式要求>\n你的回答必须是一个 JSON 对象，不要任何解释文字，不要 markdown 代码围栏。\n${constraints
       .map((c) => `- ${c}`)
       .join('\n')}\n</格式要求>`;
   }
@@ -253,15 +253,31 @@ export async function callModel(opts) {
   const totalUsage = { promptTokens: 0, completionTokens: 0 };
   let attemptsMade = 0;
 
+  /**
+   * 时间预算：整条链的**总**墙钟时间上限。
+   *
+   * 为什么必须有：普通人不会盯着一个卡住的页面看 15 分钟，他们会关掉然后觉得
+   * "这破玩意没用"。所以宁可少试几个模型，也要保证一个阶段在有限时间内出结果。
+   * 默认 = 单次超时 × 2，最少 90 秒。
+   */
+  const budgetMs = opts.budgetMs ?? Math.max(90_000, timeoutMs * 2);
+  const deadline = now() + budgetMs;
+  let budgetExhausted = false;
+
   for (let ci = 0; ci < chain.length; ci += 1) {
     const step = chain[ci];
 
-    const MAX_ATTEMPTS = 3;
+    // provider 级尝试：首次 + 1 次重试。再多就是拿用户的时间赌运气了。
+    const MAX_ATTEMPTS = 2;
     let schemaRetryUsed = false;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
       if (signal?.aborted) {
         throw new AppError(ERR.LLM_ABORTED, '任务已被取消。', { status: 499 });
+      }
+      if (now() >= deadline) {
+        budgetExhausted = true;
+        break;
       }
       attemptsMade += 1;
       let userContent = user;
@@ -311,7 +327,10 @@ export async function callModel(opts) {
           json = repaired.value;
           // 先尝试语义收敛：把 "0.95" 这类「意思对、格式不听话」的值救回来。
           // 这一步能大幅降低「模型其实答对了但我们判它失败」的概率。
-          const changed = coerceInPlace(json, schema);
+          // ⚠️ 用 coerce() 而不是 coerceInPlace()：后者在新签名下总是返回哨兵 NO_MATCH
+          // （真值），直接 if 判断会导致**每次结构化调用都谎报"已修正"**。
+          // 这是 QA 登记的缺陷 #6，改动前请先跑 tests/unit/gateway.test.js。
+          const { changed } = coerce(json, schema);
           if (changed) {
             notice('已自动修正模型输出中的个别格式偏差（例如把 0.95 归一为 high）。', 'info');
           }
@@ -372,6 +391,20 @@ export async function callModel(opts) {
     if (ci < chain.length - 1) {
       notice(`切换到备用模型继续（${PROVIDERS[chain[ci + 1].provider]?.label ?? chain[ci + 1].provider}）。`);
     }
+  }
+
+  if (budgetExhausted) {
+    const detail = lastError?.message ? redactSecrets(lastError.message) : '模型一直没能按要求的格式作答';
+    const err = new AppError(
+      ERR.LLM_TIMEOUT,
+      `这一步花了太久（超过 ${Math.round(budgetMs / 1000)} 秒）还没拿到可用结果，已经先停下来，免得你一直等。最后一次的原因：${detail}`,
+      { status: 504, cause: lastError },
+    );
+    err.attempts = attemptsMade;
+    err.usage = totalUsage;
+    err.ms = totalMs;
+    err.budgetExhausted = true;
+    throw err;
   }
 
   const detail = lastError?.message ? redactSecrets(lastError.message) : '未知原因';

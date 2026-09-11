@@ -1,0 +1,144 @@
+# 测试指南（写给后面的维护者）
+
+> 这份文档的目标：**你不需要重新推导一遍，就能知道该跑什么、什么时候会红、以及哪里其实没测到。**
+> 最后更新：2026-09-12（QA 工程师 S8）
+
+---
+
+## 1. 三十秒上手
+
+```bash
+# 全部单测 + e2e（e2e 的 demo 模式离线跑，不需要网络和 Key，约 40 秒）
+npx vitest run
+
+# 只跑我负责的两块
+npx vitest run tests/unit/gateway.test.js tests/e2e/pipeline.test.js
+
+# 一键冒烟：起真服务（非默认端口）→ 建 demo 任务 → 核对验收标准 → 自清理
+node scripts/smoke.js          # 退出码 0 = 通过
+
+# 真打模型（慢，需要网络 + 一个可用的 Key，会自动从 Cherry Studio 读）
+HANDOFF_INTEGRATION=1 npx vitest run tests/e2e/pipeline.test.js
+```
+
+**测试栈**：vitest 5 + supertest。**不新增依赖**是硬约束，所以没有 nock、没有 msw ——
+所有网络替身都是手写的（见 `tests/helpers/`）。
+
+---
+
+## 2. 测试金字塔（以及每一层防的是什么）
+
+```
+        ▲  node scripts/smoke.js            ← 一键冒烟：起真服务走真 HTTP。防「装不起来 / 端口读错 / 起不来」
+        │  tests/e2e/pipeline.test.js       ← 端到端：HTTP → 引擎 → 交付物。防「模块都对但接不上」
+        │  tests/unit/*.test.js             ← 单元：每个模块自己的边界。防「逻辑错」
+        ▼  tests/helpers/                   ← 替身：mock-llm（模型）、e2e-harness（剧本模型 + 装配）
+```
+
+### 这些测试文件分别归谁
+| 文件 | 归属 | 覆盖什么 |
+|---|---|---|
+| `tests/unit/gateway.test.js` | QA (S8) | 重试 / 降级 / JSON 抢救 / 超时 / 取消 / 密钥不泄漏 / 退避抖动 |
+| `tests/unit/fixtures.test.js` | QA (S8) | 演示数据的形状与自洽（严格对齐 CONTRACT §2） |
+| `tests/e2e/pipeline.test.js` | QA (S8) | demo 模式、真实模式、失败保留产物、取消、并发 5 个任务 |
+| `tests/helpers/mock-llm.js` | QA (S8) | 可控的假 fetch / 假 sleep（**绝不打真网络**） |
+| `tests/helpers/e2e-harness.js` | QA (S8) | 剧本模型（按阶段返回合法 JSON）、临时数据目录、轮询等待 |
+| `tests/unit/security.test.js` | S6 | 注入检测 / PII / 转义 / 限流规则 |
+| `tests/unit/routes.test.js` | S4 | HTTP 端点正常路径 + 错误路径 |
+| `tests/unit/store.test.js` | S4 | 原子写、并发串行化、路径穿越 |
+| `tests/unit/frontend.test.js` | S5 | markdown 渲染 / XSS 中和 / 状态映射 |
+
+---
+
+## 3. 哪些测试需要网络（重要）
+
+| 测试 | 需要网络？ | 条件 |
+|---|---|---|
+| `tests/unit/gateway.test.js` | ❌ 绝不 | 所有 fetch 都是 `tests/helpers/mock-llm.js` 的桩。**如果你发现它变慢了，说明有桩没注入进去** |
+| `tests/unit/fixtures.test.js` | ❌ | 纯数据 + 假延时 |
+| `tests/e2e/pipeline.test.js` A 段（demo） | ❌ | `demo:true` 完全不调模型 |
+| `tests/e2e/pipeline.test.js` C 段（失败与边界） | ❌ | 用剧本模型，或临时替换 `globalThis.fetch` |
+| `tests/e2e/pipeline.test.js` B 段（真实模式） | ✅ | 只有 `HANDOFF_INTEGRATION=1` 时才运行，默认 300 秒预算（可用 `HANDOFF_INTEGRATION_TIMEOUT_MS` 放宽） |
+| `scripts/smoke.js` | ❌ | 走 `demo:true` |
+
+**为什么会有一条真跑测试**：mock 再全也证明不了「我们的请求格式、Key 解析、真实模型的输出，
+凑在一起能不能跑通」。这一条就是那道保险，代价是慢和可能因为上游抖动而红。
+
+---
+
+## 4. 几条很容易踩的测试纪律
+
+1. **`sleep` 必须 mock。** 网关失败时会退避（600ms 起，指数增长）。
+   不 mock 的话一个用例就要等好几秒，而且会 flaky。`makeSleep()` 记录等待时长但不真的等。
+2. **不要用 `vi.useFakeTimers()` 配 async。** 本项目一律用「注入假 sleep + 假 fetch」，
+   比假时钟稳得多，也更容易看出被测代码到底等了几次。
+3. **给网关传 `deps`**：`{ fetch, chain, resolveKey, env, sleep }`。
+   网关的依赖全部走 `opts.deps`，就是为了让测试能这样注入（它也绝不在模块顶层读环境变量）。
+4. **假 fetch 必须响应 `init.signal`**（`hangingFetch()` 就是这么写的）。
+   否则超时 / 取消路径根本测不出来 —— 真实 fetch 会 abort，假的也必须会。
+5. **e2e 里改 `engine.deps.callModel` 后要挂到任务跑完再还原。** 流水线在后台跑，
+   提前还原会让后面的阶段去打真网络，测出来的失败原因是错的。
+6. **`it.fails(...)` 是「已知缺陷」的登记方式。** 缺陷修好后它会变红 ——
+   那不是回归，而是提醒你把它改成 `it(...)` 正断言。每条都带 `【缺陷 #N】` 前缀，
+   对应 `docs/reports/S8-QA.md` 的缺陷清单。
+7. **临时数据目录用完必须删。** `makeTempDataDir()` / `cleanupTempDataDir()` 成对使用；
+   `scripts/smoke.js` 在 `finally` 里关子进程 + 删目录，成功失败都清理。
+
+---
+
+## 5. 已知的测试盲区（诚实列出，别以为绿了就没事）
+
+这些地方**没有自动化覆盖**，改动时请人工确认：
+
+1. **真实模型的输出质量。** 我们只验证「引擎能不能处理模型的输出」，
+   不验证「模型写得好不好」。真实模式测试只断言 `content.length > 80`，
+   一份胡说八道但很长的交付物同样会通过。
+2. **真实 SSE 在浏览器里的行为。** e2e 用 Node 的 `fetch` 读流，验证了协议形状
+   （`event: message` / `id:` / 首帧快照）；
+   但 EventSource 的自动重连、`Last-Event-ID` 补发、15 秒心跳在代理后的表现，
+   都没有自动化测试（建议上线前人工断网试一次）。
+3. **前端视觉与交互。** 没有浏览器测试（不引入依赖的代价）。
+   「空状态好不好看」「360px 下会不会横向滚动」这类只能人看。
+4. **持久化的真实崩溃场景。** `store` 的单测覆盖了原子写和并发串行化，
+   但「写盘写到一半被 kill -9」没有真跑过（用的是临时文件 + rename 的推理保证）。
+5. **限流在多进程/多实例下的行为。** 限流是进程内 Map，单进程正确；
+   多实例部署时形同虚设（也没有 `trust proxy`，反向代理后面所有用户共用一个 IP）。
+6. **长任务与内存上限。** 事件日志每任务最多 500 条、内存最多 200 个 job，
+   但没有跑过「几十个任务同时跑 10 分钟」的压力测试。
+7. **`HANDOFF_INTEGRATION` B 段的稳定性。** 它依赖真实上游，可能因为限流/网络而红；
+   我们把它单独隔离，不让它拖累日常测试。
+8. **Windows / 非 macOS。** Key 自动解析依赖 `~/Library/Application Support/CherryStudio`
+   （macOS 路径），其他平台只能靠环境变量，这条路径没有测试。
+
+---
+
+## 5.1 当前「还没修」的已知缺陷（红着的用例就是待办清单）
+
+截至 2026-09-12（QA 本轮结束）：
+
+| 编号 | 严重度 | 一句话 | 用例 |
+|---|---|---|---|
+| #10 | 🔴 高 | **真实模式跑不到 done**：critique 超时 120s → 重试 3 次 × 降级 5 个 provider = 15 次尝试，12 分钟后整任务 failed | `HANDOFF_INTEGRATION=1` 的 B 段 |
+| #4 | 🔴 高 | 取消任务被标成 `failed` 而不是 `cancelled` | `it.fails` 取消 |
+| #5 | 🔴 高 | 前端发 `{message}`、后端读 `{text}` → 追加要求 / 回答澄清 100% 400 | 字段名那条 |
+| #6 | 🟠 中 | 没改任何东西也会发「已自动修正格式偏差」通知 | `it.fails` 缺陷 #6 |
+| #11 | 🟠 中 | 长文本协议下 artifacts 不校验 → `confidence: "0.95"` 进交付物，违反契约 | `it.fails` 缺陷 #11 |
+| #7 | 🟡 低 | 端口被占用时报 `TypeError` 而不是 EADDRINUSE | 手工复现（见报告） |
+| #8 | 🟡 低 | `.env.example` 里的 `HANDOFF_DEMO` 没人读 | `grep` |
+| #9 | ⚪ 观察 | 引擎的 job/stage 比契约多字段，demo 与真实模式阶段形状不同 | 见报告 |
+
+## 6. 复现缺陷的入口
+
+`docs/reports/S8-QA.md` 里的每条缺陷都带可复制的命令。
+最快的三个入口：
+
+```bash
+# 1) 看「已知缺陷」有哪些还是红的（it.fails 的用例）
+npx vitest run tests/unit/gateway.test.js tests/e2e/pipeline.test.js --reporter=verbose | grep '缺陷'
+
+# 2) 交付物正文有没有真的返回给前端（缺陷 #2）
+node scripts/smoke.js && curl -s localhost:<port>/api/jobs/<id> | head -c 400
+
+# 3) 服务启动失败的报错是不是人话（缺陷 #7）
+node -e "require('net').createServer().listen(8899,'127.0.0.1')" & PORT=8899 node src/server.js
+```

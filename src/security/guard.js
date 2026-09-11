@@ -345,7 +345,9 @@ const DANGEROUS_PATTERNS = [
   { id: 'paste-terminal', re: /(?:粘贴|复制|输入)[^。\n]{0,20}(?:到|进|入)\s*(?:你的)?\s*(?:终端|命令行|cmd|powershell|Terminal|shell|控制台)/i, label: '引导用户把命令粘贴到终端' },
   // 必须容忍三种真实写法：`rm -rf /`、`rm -fr /`、`rm -r -f /`
   // 以及 `sudo rm -rf --no-preserve-root /`（最初的分支漏了 --long-option）
-  { id: 'rm-rf', re: /(?:^|[\s;&|(])(?:sudo\s+)?rm\s+-(?:[a-zA-Z]*[rf][a-zA-Z]*|r\s+-\s*f|f\s+-\s*r)\b[^\n]{0,60}?(?:--\S+\s+)*(?:\/|~|\*|\$)/i, label: 'rm -rf 删除命令' },
+  // 前缀不能写死成 [\s;&|(]：中文里会出现「第一步：rm -rf /」这种紧贴的写法。
+  // 用 (?<![\w-]) 保证左边不是单词字符/连字符即可（`xrm`、`/bin/rm` 都能正确区分）。
+  { id: 'rm-rf', re: /(?<![\w-])(?:sudo\s+)?rm\s+-(?:[a-zA-Z]*[rf][a-zA-Z]*|r\s+-\s*f|f\s+-\s*r)\b[^\n]{0,60}?(?:--\S+\s+)*(?:\/|~|\*|\$)/i, label: 'rm -rf 删除命令' },
   { id: 'curl-sh', re: /\b(?:curl|wget)\b[^\n|]{0,200}\|\s*(?:sudo\s+)?(?:ba)?sh\b/i, label: 'curl | sh 管道执行远程脚本' },
   { id: 'chmod-777', re: /\bchmod\s+(?:-R\s+)?777\b/i, label: 'chmod 777 放开全部权限' },
   { id: 'mkfs-dd', re: /\bmkfs(?:\.\w+)?\b|\bdd\s+if=.{0,40}\bof=\/dev\//i, label: '格式化 / 覆写磁盘设备' },
@@ -376,8 +378,13 @@ function scanText(text, where) {
   //    `looksLikeSecret()` 来自 src/llm/errors.js（S1 的文件，不能改），它的规则区分大小写，
   //    所以这里用「原文 + 小写副本」各判一次 —— `SK-...` / `BEARER ...` 是真实配置写法，
   //    只靠原文会漏（测试 C8）。这是不改别人文件的规避写法。
-  if (looksLikeSecret(s) || looksLikeSecret(s.toLowerCase())) {
-    const redacted = redactSecrets(s);
+  //    原文 / 全小写 / 全大写 三种形态各判一次：像 `Qc-…` 这种混合大小写，
+  //    既不是全大写也不是全小写，只看那两种仍会漏（测试 C8）。
+  if (looksLikeSecret(s) || looksLikeSecret(s.toLowerCase()) || looksLikeSecret(s.toUpperCase())) {
+    //    ⚠️ 重要：S1 的 redactSecrets() 区分大小写，`SK-abcdef…` 它**不会**打码。
+    //    如果这里直接用它的结果做预览，大写密钥就会原样写进 findings → 进 SSE → 被分享。
+    //    所以先补一遍大小写不敏感的打码，再取预览（测试 C8 专门盯这一点）。
+    const redacted = redactCaseInsensitive(redactSecrets(s));
     const masked = countSecrets(s);
     out.push(
       finding('secret_leak', {
@@ -403,7 +410,24 @@ function scanText(text, where) {
     );
   }
 
-  // 3) 危险指令
+  // 3) 编码后夹带的注入：base64 是真实会被用来"把指令藏起来"的手法。
+  //    只做一层解码，且解码产物不再递归解码（避免解码链 DoS / 无限递归）。
+  const encoded = decodeBase64Chunks(s);
+  if (encoded.length > 0) {
+    const encodedHits = detectInjection(encoded);
+    if (encodedHits.length > 0) {
+      out.push(
+        finding('prompt_injection', {
+          severity: 'medium',
+          where,
+          detail: `${KIND_TEXT.prompt_injection.detail}（这段内容是 base64 编码的，解码后命中：${summarizeHits(encodedHits)}）`,
+          action: KIND_TEXT.prompt_injection.action,
+        }),
+      );
+    }
+  }
+
+  // 4) 危险指令
   const danger = DANGEROUS_PATTERNS.filter((p) => safeTest(p.re, s)).map((p) => p.label);
   if (danger.length > 0) {
     out.push(
@@ -416,7 +440,7 @@ function scanText(text, where) {
     );
   }
 
-  // 4) HTML / 脚本
+  // 5) HTML / 脚本
   // 先解码 HTML 实体再匹配：`&#60;script&#62;` 是真实存在的绕过手法
   // （浏览器会把实体还原成 <script>，只看原字符会漏）。测试 E5 覆盖这一点。
   const decoded = decodeHtmlEntities(s);
@@ -435,16 +459,70 @@ function scanText(text, where) {
   return out;
 }
 
+/**
+ * 从文本里挑出"像 base64 的长串"并解码，拼成一段用于检测的文本。
+ *
+ * 为什么需要：攻击者可以把 `ignore all previous instructions` 编码成
+ * `aWdub3JlIGFsbCBwcmV2aW91cyBpbnN0cnVjdGlvbnM=` 塞进文档，
+ * 表面上完全无害。测试 A19 覆盖这一点。
+ *
+ * 防 DoS：最多看 8 段、每段最多 2000 字符、解码总长上限 8000 字符。
+ */
+export function decodeBase64Chunks(text, { maxChunks = 8, maxChunk = 2000, maxTotal = 8000 } = {}) {
+  const s = String(text ?? '');
+  const re = /[A-Za-z0-9+/]{24,}={0,2}/g;
+  let m;
+  const parts = [];
+  let total = 0;
+  while ((m = re.exec(s)) !== null && parts.length < maxChunks) {
+    const chunk = m[0].slice(0, maxChunk);
+    try {
+      if (typeof Buffer === 'undefined') return '';
+      const buf = Buffer.from(chunk, 'base64');
+      const decoded = buf.toString('utf8');
+      // 必须能还原成可读文本，否则说明只是普通的长数字/长单词
+      if (!decoded || decoded.length < 8) continue;
+      // 必须能还原成"像人写的文本"：
+      //   1) 控制字符要少（U+FFFD 替换符不算控制字符，所以还要第 2 条）
+      //   2) 落在 ASCII / 中日韩 / 常用标点之外的字符要少 ——
+      //      否则纯数字长串（订单号、时间戳）经 base64 解码出乱码后也会被当成"内容"
+      const printable = decoded.replace(/[^\P{C}]/gu, '').length / decoded.length;
+      if (printable < 0.85) continue;
+      const readable = decoded.replace(/[\u0000-\u007F\u3000-\u303F\u4E00-\u9FFF\uFF00-\uFFEF\u2000-\u206F]/g, '').length / decoded.length;
+      if (readable > 0.3) continue;
+      parts.push(decoded);
+      total += decoded.length;
+      if (total > maxTotal) break;
+    } catch {
+      /* 不是合法 base64：忽略 */
+    }
+  }
+  return parts.join('\n').slice(0, maxTotal);
+}
+
 /** 统计疑似密钥数量（与 errors.js 的 SECRET_PATTERNS 同一套规则，只数不改） */
 function countSecrets(text) {
   let n = 0;
   for (const re of SECRET_PATTERNS_SAFE()) {
-    re.lastIndex = 0;
-    const m = text.match(re);
-    re.lastIndex = 0;
-    if (m) n += m.length;
+    // 同一段文字里出现同一条规则的不同大小写形态时，只算一次（避免重复计数）
+    const m = String(text).match(re);
+    if (m && m.length > 0) n += m.length;
   }
   return n;
+}
+
+/**
+ * 大小写不敏感的打码（补 redactSecrets 的漏洞）。
+ * 只在 guard 内部用于生成对外文本，不改动 S1 的文件。
+ */
+function redactCaseInsensitive(input) {
+  let out = String(input ?? '');
+  for (const re of SECRET_PATTERNS_SAFE()) {
+    re.lastIndex = 0;
+    out = out.replace(re, '[已隐去密钥]');
+    re.lastIndex = 0;
+  }
+  return out;
 }
 
 /** 打码后的短预览：只取被替换成 [已隐去密钥] 的上下文，确保不含原文 */
@@ -557,6 +635,17 @@ function extractPlanText(plan) {
   return parts;
 }
 
+/** 产物里"有内容"的字符数（去掉所有空白），用于判断是否真的产出了东西 */
+function nonWhitespaceLength(artifacts) {
+  let total = 0;
+  for (const [i, art] of (Array.isArray(artifacts) ? artifacts : []).entries()) {
+    for (const p of extractArtifactText(art, i)) {
+      total += p.text.replace(/\s+/g, '').length;
+    }
+  }
+  return total;
+}
+
 function sumArtifactLength(artifacts) {
   let total = 0;
   for (const [i, art] of (Array.isArray(artifacts) ? artifacts : []).entries()) {
@@ -642,7 +731,8 @@ export function auditJob({ artifacts = [], review = null, plan = null, security 
     };
   }
 
-  const totalLen = sumArtifactLength(list);
+  // 只数"有内容的字符"：500 个字面空格不该被算成有效产出
+  const totalLen = nonWhitespaceLength(list);
   if (totalLen < MIN_ARTIFACT_LENGTH) {
     return {
       level: 'blocked',

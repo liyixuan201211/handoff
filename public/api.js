@@ -164,6 +164,27 @@ export function createApi(options) {
       return request('/api/health', { method: 'GET' });
     },
 
+    /**
+     * 取交付物正文（纯文本 markdown）。
+     *
+     * 为什么单独取一次：`GET /api/jobs/:id` 出于列表体积考虑**不返回 content**
+     * （S4 的实现与测试都明确如此：详情里只给 bytes/name），正文只存在于下载端点。
+     * 所以详情页按需拉一次，并在内存里缓存。
+     * @returns {Promise<string>}
+     */
+    async getArtifactText(jobId, artifactId) {
+      const f = pickFetch();
+      if (!f) throw Object.assign(new Error('NETWORK_ERROR'), { code: 'NETWORK_ERROR' });
+      const href = url('/api/jobs/' + encodeURIComponent(jobId) + '/artifacts/' + encodeURIComponent(artifactId) + '/download');
+      const res = await f(href);
+      if (!res || !res.ok) {
+        throw Object.assign(new Error('这个成果暂时拿不到正文'), {
+          code: 'ARTIFACT_UNAVAILABLE', status: res ? res.status : 0,
+        });
+      }
+      return typeof res.text === 'function' ? res.text() : '';
+    },
+
     /** 交付物下载地址（浏览器直接打开即可，服务端会带 Content-Disposition）。 */
     artifactDownloadUrl(jobId, artifactId) {
       return url('/api/jobs/' + encodeURIComponent(jobId) + '/artifacts/' + encodeURIComponent(artifactId) + '/download');

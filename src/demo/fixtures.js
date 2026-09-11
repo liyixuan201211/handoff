@@ -345,6 +345,18 @@ const STAGE_SCRIPT = [
 
 /** 阶段之间的固定间隔（毫秒），让时间线看起来像真的在跑，而不是几个数字挤在一起 */
 const STAGE_GAP_MS = 80;
+/** 接到任务到开始干活之间的启动延迟 */
+const START_DELAY_MS = 120;
+
+/**
+ * 整条演示任务的时间线长度。
+ * 注意：是 n-1 个阶段间隔，不是 n 个 —— 这里算错会让最后一个阶段跑到 updatedAt 之后，
+ * tests/unit/fixtures.test.js 会立刻抓到（这正是它存在的意义）。
+ */
+const demoTotalMs = () =>
+  START_DELAY_MS +
+  STAGE_SCRIPT.reduce((s, x) => s + x.ms, 0) +
+  (STAGE_SCRIPT.length - 1) * STAGE_GAP_MS;
 
 /* ================================================================== *
  * demoJob()
@@ -362,7 +374,7 @@ const STAGE_GAP_MS = 80;
  */
 export function demoJob(goal = DEFAULT_DEMO_GOAL, opts = {}) {
   const goalText = typeof goal === 'string' && goal.trim() ? goal.trim() : DEFAULT_DEMO_GOAL;
-  const totalMs = STAGE_SCRIPT.reduce((s, x) => s + x.ms, 0) + STAGE_SCRIPT.length * STAGE_GAP_MS;
+  const totalMs = demoTotalMs();
 
   // 让「刚跑完」的任务看起来自然：createdAt 在 totalMs 之前，updatedAt 就是现在。
   const updatedAt = Date.now();
@@ -374,7 +386,7 @@ export function demoJob(goal = DEFAULT_DEMO_GOAL, opts = {}) {
 
   // ── 阶段 ──────────────────────────────────────────────────────
   const stages = [];
-  let cursor = createdAt + 120; // 接到任务后有一点点启动延迟
+  let cursor = createdAt + START_DELAY_MS; // 接到任务后有一点点启动延迟
   STAGE_SCRIPT.forEach((s, i) => {
     const startedAt = cursor;
     const endedAt = startedAt + s.ms;

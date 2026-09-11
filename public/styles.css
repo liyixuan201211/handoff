@@ -674,3 +674,11 @@ button { font: inherit; color: inherit; }
   .topbar, .footer, .btn, .tabs { display: none; }
   body { background: #fff; }
 }
+
+/* 交付物正文未随详情返回时的占位（正文按需从下载端点取） */
+.artifact-pending {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  background: var(--surface-2); border: 1px dashed var(--line);
+  border-radius: var(--r-sm); padding: 10px 14px; margin-top: 10px;
+}
+.artifact-pending p { margin: 0; color: var(--text-2); font-size: .9rem; }

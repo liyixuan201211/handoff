@@ -63,7 +63,8 @@ export function sseHandler({ jobId, req, res, sinceSeq = 0 } = {}) {
   res.flushHeaders?.();
 
   const cursor = resolveSince(req, sinceSeq);
-  const sent = new Set();
+  /** 已发出的最大 seq。补发区间的去重只需要它，不需要无限增长的 Set */
+  let lastSent = cursor;
   let closed = false;
   let unsubscribe = null;
   let heartbeat = null;
@@ -79,12 +80,19 @@ export function sseHandler({ jobId, req, res, sinceSeq = 0 } = {}) {
     }
   };
 
+  // 立刻吐一个注释帧：告诉客户端/代理「连接已建立」。
+  // 没有这一行的话，一个刚创建、还没有任何事件的 job 会让前端干等到 15 秒心跳，
+  // 用户看到的就是「转圈圈卡住」。注释帧不触发 onmessage，纯做保活。
+  write(': connected\n\n');
+
   const send = (event) => {
     if (closed || !event || typeof event !== 'object') return;
     if (Number.isFinite(event.seq)) {
-      if (event.seq <= cursor) return; // 历史已补发，别重复
-      if (sent.has(event.seq)) return;
-      sent.add(event.seq);
+      // 已经发过的一律不重发（补发区间与实时推送在 subscribe 之后可能重叠）。
+      // 只比较 lastSent 而不是维护一个 Set：SSE 连接可能挂几个小时，
+      // 每条事件都塞进 Set 就是一个稳定增长的内存泄漏。
+      if (event.seq <= lastSent) return;
+      lastSent = event.seq;
     }
     write(formatSse(event));
   };
@@ -102,7 +110,8 @@ export function sseHandler({ jobId, req, res, sinceSeq = 0 } = {}) {
     res.off?.('error', cleanup);
   }
 
-  // 先订阅再补发历史：中间留出 await 的话会漏事件，sent 集合负责去重
+  // 先订阅再补发历史：subscribe 与补发之间没有 await，所以不会漏事件；
+  // lastSent 游标负责把两边可能重叠的部分去重。
   unsubscribe = events.subscribe(jobId, send);
 
   // 一条一条写就好（补发是本地内存数组，量很小）
