@@ -17,6 +17,7 @@
     "smoke": "node scripts/smoke.js"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "express": "^5.2.1"
   },
   "devDependencies": {

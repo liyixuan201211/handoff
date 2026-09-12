@@ -150,6 +150,23 @@ function buildShell(state) {
  * 首页
  * ------------------------------------------------------------------ */
 
+/**
+ * 把工具参数说成一句人话（只挑最要紧的那个参数显示）。
+ *
+ * ⚠️ 前端**不能**从服务端模块 import —— 浏览器里没有那些模块。
+ * 所以这个函数在这儿有一份独立实现。它和 `src/pipeline/engine.js` 里的同名函数
+ * 是**刻意重复**的：一边跑在浏览器、一边跑在 Node，共享代码需要一个构建步骤，
+ * 而我们这个项目的承诺是"没有构建步骤"。
+ * 两份实现都很小、都很稳定，重复的代价低于引入构建的代价。
+ */
+function describeToolArgs(args) {
+  if (!args || typeof args !== 'object') return '';
+  const v = args.url ?? args.query ?? args.path ?? args.text ?? args.q ?? null;
+  if (typeof v !== 'string' || !v.trim()) return '';
+  const short = v.length > 70 ? v.slice(0, 70) + '…' : v;
+  return '：' + short;
+}
+
 function templateCard(tpl, onPick) {
   const role = tpl.role || '团队成员';
   const hue = roleHue(role);
@@ -787,6 +804,46 @@ class JobView {
       return;
     }
 
+    // 工具调用：这是"团队对外界动手了"，值得在日志里被单独标出来。
+    // 后端已经发过一条普通日志，这里再补一条带图标的，视觉上能跳出来。
+    if (evt.type === 'tool') {
+      const label = evt.label || evt.name || '工具';
+      if (evt.phase === 'start') {
+        this.enqueueLog({
+          stageId: evt.stageId,
+          level: 'info',
+          icon: '🔧',
+          at: evt.at,
+          text: `正在用「${label}」${describeToolArgs(evt.args)}`,
+        });
+      } else {
+        const secs = typeof evt.ms === 'number' ? `${(evt.ms / 1000).toFixed(1)} 秒` : '';
+        this.enqueueLog({
+          stageId: evt.stageId,
+          level: evt.status === 'ok' ? 'info' : 'warn',
+          icon: evt.status === 'ok' ? '✅' : '⚠️',
+          at: evt.at,
+          text:
+            evt.status === 'ok'
+              ? `「${label}」拿到结果${secs ? `（${secs}）` : ''}${evt.summary ? `：${evt.summary}` : ''}`
+              : `「${label}」没成功${evt.error ? `：${evt.error}` : ''}`,
+        });
+      }
+      return;
+    }
+
+    // 技能加载：告诉用户"这类事我们有经验可用"
+    if (evt.type === 'skills' && Array.isArray(evt.names) && evt.names.length) {
+      this.enqueueLog({
+        stageId: (job && job.stages && job.stages[0] && job.stages[0].id) || null,
+        level: 'info',
+        icon: '📚',
+        at: Date.now(),
+        text: `用上了这些经验：${evt.names.join('、')}`,
+      });
+      return;
+    }
+
     if (evt.type === 'stage' && job && Array.isArray(job.stages)) {
       const stage = job.stages.find((s) => s.id === evt.stageId);
       if (stage) {
@@ -1116,11 +1173,17 @@ class JobView {
     const frag = document.createDocumentFragment();
     queue.forEach((entry) => {
       const tone = entry.level === 'error' ? 'bad' : entry.level === 'warn' ? 'warn' : 'info';
-      frag.appendChild(el('li', { class: 'log-line ' + toneClass(tone) }, [
+      const children = [
         el('time', { class: 'log-time mono', datetime: new Date(entry.at).toISOString() },
           new Date(entry.at).toLocaleTimeString('zh-CN', { hour12: false })),
-        text('span', 'log-text', entry.text),
-      ]));
+      ];
+      // 工具相关的日志加个图标，让它从普通日志里跳出来 ——
+      // 用户需要一眼看到"团队上网查东西了"，那是对外界的动作，值得被区分出来。
+      if (entry.icon) {
+        children.push(el('span', { class: 'log-icon', 'aria-hidden': 'true' }, entry.icon));
+      }
+      children.push(text('span', 'log-text', entry.text));
+      frag.appendChild(el('li', { class: 'log-line ' + toneClass(tone) + (entry.icon ? ' log-line-tool' : '') }, children));
     });
     node.logList.appendChild(frag);
     this.pendingLogs.set(stageId, []);

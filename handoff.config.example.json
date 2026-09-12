@@ -1,0 +1,53 @@
+{
+  "$comment": "交接 Handoff 的能力配置示例。复制成 handoff.config.json 后按需修改。\\n⚠️ 默认全部关闭是**刻意的**：这个程序能读你的文件、能上外网、能拉起外部进程，\\n  默认全开等于把一个不受约束的 Agent 交给每一个 clone 它的人。",
+  "tools": {
+    "webFetch": {
+      "enabled": true,
+      "allowHosts": [],
+      "allowPrivateHosts": false
+    },
+    "webSearch": {
+      "enabled": false
+    },
+    "readFile": {
+      "enabled": true,
+      "allowedRoots": [
+        ".",
+        "~/Desktop",
+        "~/Documents"
+      ]
+    },
+    "maxCallsPerJob": 24
+  },
+  "mcp": {
+    "enabled": false,
+    "callTimeoutMs": 30000,
+    "servers": {
+      "example-http": {
+        "type": "http",
+        "url": "https://your-mcp-server.example.com/mcp"
+      },
+      "example-stdio": {
+        "type": "stdio",
+        "command": "npx",
+        "args": [
+          "-y",
+          "some-mcp-package"
+        ],
+        "enabled": false
+      }
+    },
+    "$comment": "MCP 外部工具服务。stdio 类型会在你机器上执行命令，所以**必须**同时写 enabled:true。\\n  下面两个例子是注释性质的，真要用请把 enabled 改成 true 或补全字段。"
+  },
+  "skills": {
+    "dirs": [
+      "skills"
+    ],
+    "maxCharsPerSkill": 4000,
+    "maxSkills": 3
+  },
+  "toolStages": [
+    "research",
+    "draft"
+  ]
+}

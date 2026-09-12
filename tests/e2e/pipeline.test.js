@@ -34,6 +34,7 @@ import {
   scriptedOutputFor,
 } from '../helpers/e2e-harness.js';
 import { createApp } from '../../src/server.js';
+import { setToolConfig } from '../../src/pipeline/engine.js';
 
 const STAGE_ORDER = ['intake', 'plan', 'research', 'draft', 'critique', 'revise', 'verify', 'deliver'];
 
@@ -106,6 +107,9 @@ beforeAll(async () => {
 afterAll(() => {
   store.stopSyncTimer();
   cleanupTempDataDir(dataDir);
+  // 工具配置是全局的（引擎里一个引用），用例之间要清干净，
+  // 否则一个用例开了工具会影响下一个用例的行为。
+  setToolConfig(null);
 });
 
 /* ================================================================== *
@@ -753,4 +757,123 @@ describe('可选阶段降级：critique / revise 失败不能让整个任务失�
     // 用户能看到"这一步跳过了"，而不是一脸问号
     expect(critique.log.map((l) => l.text).join(' ')).toMatch(/跳过|没做成/);
   }, 90_000);
+});
+
+/* ================================================================== *
+ * 回归：工具事件必须真的发出来，并且留在 job 上
+ *
+ * 这个 bug 花了一小时才找到，值得单独钉住：
+ *
+ * engine.js 里 `onToolCall` 那个回调是从 runOneStage **搬**到 execute() 里的，
+ * 但里面引用了一个只存在于 runOneStage 参数里的变量 `stage`。
+ * 于是 start 分支每次都抛 `ReferenceError: stage is not defined` ——
+ * 而它外面包着一层 `try { } catch { /* 忽略 *\/ }`，把错误**完全吞掉**。
+ *
+ * 症状：功能"看起来没生效但不报错"——
+ *   · 界面上看不到"团队正在用某个工具"
+ *   · job.toolCalls 永远是空数组
+ *   · 没有任何日志、没有任何异常
+ *
+ * 教训：**catch 里什么都不做，等于把 bug 藏起来。**
+ * 现在两处 catch 都会打 warn，并且这个用例会验证事件真的到齐。
+ * ================================================================== */
+describe('回归：工具调用的事件与轨迹必须完整', () => {
+  it('start / end 事件都要发出来，且写进 job.toolCalls 并落盘', async () => {
+    // 注入一个必定成功的 web_fetch，避免依赖网络（网络失败会让这个用例变成 flaky）
+    const { registerWebFetch } = await import('../../src/tools/native.js');
+    const { clearTools } = await import('../../src/tools/registry.js');
+    clearTools();
+    // 显式告诉引擎"调研阶段可以用工具" —— 不然 toolsAvailable 是空的，
+    // 模型拿不到工具列表，这个用例就变成"什么也没测"（第一次就是这么写的）
+    setToolConfig({ toolStages: ['research', 'draft'], skills: { dirs: [] } });
+    registerWebFetch({
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'text/html; charset=utf-8' },
+        arrayBuffer: async () =>
+          new TextEncoder().encode('<html><title>T</title><body>工具内容标记 ZZZTOOLMARK</body></html>').buffer,
+      }),
+    });
+
+    const realKeys = { aiping: process.env.AIPING_API_KEY, deepseek: process.env.DEEPSEEK_API_KEY };
+    process.env.AIPING_API_KEY = 'sk-test-0000000000000000';
+    process.env.DEEPSEEK_API_KEY = 'sk-test-0000000000000000';
+
+    const outputs = (await import('../helpers/e2e-harness.js')).stageOutputs();
+    let modelCall = 0;
+    const fakeFetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      modelCall += 1;
+      // 第一轮（调研）先要求调工具；之后正常返回剧本
+      const stage = stageOfRequest(body);
+      // 只在调研阶段、且这一轮还没拿到工具结果时，要求调一次工具。
+      // （不要用"第几次调用"来判断 —— 模型因为 schema 重试会让调用次数变多，
+      //   第一次我就这么写，条件永远不成立，用例变成"什么都没测"。）
+      const wantsTool = stage === 'research' && !body.messages.some((m) => m.role === 'tool');
+      const payload = wantsTool
+        ? {
+            content: '',
+            tool_calls: [
+              { id: 'call_1', type: 'function', function: { name: 'web_fetch', arguments: '{"url":"https://example.com"}' } },
+            ],
+          }
+        : { content: JSON.stringify(scriptedOutputFor(stage) ?? outputs.intake) };
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [
+              {
+                index: 0,
+                finish_reason: payload.tool_calls ? 'tool_calls' : 'stop',
+                message: { role: 'assistant', content: payload.content, ...(payload.tool_calls ? { tool_calls: payload.tool_calls } : {}) },
+              },
+            ],
+            usage: { prompt_tokens: 10, completion_tokens: 10 },
+          };
+        },
+      };
+    };
+
+    vi.stubGlobal('fetch', fakeFetch);
+    let job;
+    const toolEvents = [];
+    try {
+      const created = await request(app).post('/api/jobs').send({ goal: '用工具查一下 example.com' });
+      const id = created.body.job.id;
+      const unsub = events.subscribe(id, (e) => {
+        if (e.type === 'tool') toolEvents.push(e);
+      });
+      job = await waitForJob(app, id, { timeoutMs: 60_000, intervalMs: 100 });
+      unsub();
+    } finally {
+      vi.unstubAllGlobals();
+      clearTools();
+      setToolConfig(null);
+      if (realKeys.aiping === undefined) delete process.env.AIPING_API_KEY;
+      else process.env.AIPING_API_KEY = realKeys.aiping;
+      if (realKeys.deepseek === undefined) delete process.env.DEEPSEEK_API_KEY;
+      else process.env.DEEPSEEK_API_KEY = realKeys.deepseek;
+    }
+
+    // 1) 必须有 start 和 end 两类事件（漏了 start 就是那个被吞掉的 ReferenceError）
+    const phases = toolEvents.map((e) => e.phase);
+    expect(phases, '必须发出 start 事件（被 catch 吞掉时会一条都没有）').toContain('start');
+    expect(phases).toContain('end');
+
+    // 2) 事件要带上给用户看的名字（不能只有内部工具名）
+    const startEvt = toolEvents.find((e) => e.phase === 'start');
+    expect(startEvt.name).toBe('web_fetch');
+    expect(typeof startEvt.label).toBe('string');
+    expect(startEvt.label.length).toBeGreaterThan(0);
+    expect(startEvt.args.url).toBe('https://example.com');
+
+    // 3) 轨迹要写进 job 并落盘（否则刷新页面就看不到团队干了什么）
+    expect(Array.isArray(job.toolCalls)).toBe(true);
+    expect(job.toolCalls.length).toBeGreaterThanOrEqual(1);
+    const disk = JSON.parse(fs.readFileSync(path.join(dataDir, 'jobs', `${job.id}.json`), 'utf8'));
+    expect(disk.toolCalls.length).toBe(job.toolCalls.length);
+  }, 120_000);
 });

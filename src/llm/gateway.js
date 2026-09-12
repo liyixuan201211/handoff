@@ -100,6 +100,9 @@ async function callOnce({
   timeoutMs,
   signal,
   deps,
+  // 新增（工具循环用）：直接给完整 messages 和 tools，跳过 system/user 拼接
+  messages: providedMessages = null,
+  tools = null,
 }) {
   const def = PROVIDERS[providerId];
   if (!def) throw new AppError(ERR.LLM_NO_PROVIDER, `未知的模型提供方：${providerId}`, { status: 502 });
@@ -113,9 +116,14 @@ async function callOnce({
     );
   }
 
-  const messages = [];
-  if (system) messages.push({ role: 'system', content: system });
-  messages.push({ role: 'user', content: user });
+  let messages;
+  if (Array.isArray(providedMessages)) {
+    messages = providedMessages;
+  } else {
+    messages = [];
+    if (system) messages.push({ role: 'system', content: system });
+    messages.push({ role: 'user', content: user });
+  }
 
   const body = {
     model,
@@ -124,6 +132,13 @@ async function callOnce({
     max_tokens: maxTokens,
     stream: false,
   };
+
+  // 工具调用（OpenAI 兼容格式）。只在真的传了工具时才带上这个字段 ——
+  // 有些上游对不认识的字段很敏感，不给它就不会有问题。
+  if (Array.isArray(tools) && tools.length) {
+    body.tools = tools;
+    body.tool_choice = 'auto';
+  }
 
   const flag = { timedOut: false, aborted: false };
   const { signal: combined, cleanup } = combineSignals(timeoutMs, signal, flag);
@@ -190,16 +205,176 @@ async function callOnce({
     completionTokens: json?.usage?.completion_tokens ?? 0,
   };
 
-  if (!text.trim()) {
+  const choice = json?.choices?.[0] ?? {};
+  const message = choice.message ?? {};
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  const finishReason = choice.finish_reason ?? 'unknown';
+
+  // 工具调用是**合法且有内容**的返回，即使正文是空的。
+  // 漏掉这一判断的话，模型每次决定调工具都会被我们当成"没返回正文"而重试 ——
+  // 那工具功能就完全没法工作了。
+  if (!text.trim() && toolCalls.length === 0) {
     // finish_reason=length 时也走这里，因为对我们来说就是没拿到东西
     throw new AppError(
       ERR.LLM_EMPTY_RESPONSE,
-      `模型没有返回正文内容（finish_reason=${json?.choices?.[0]?.finish_reason ?? '未知'}）。`,
+      `模型没有返回正文内容（finish_reason=${finishReason}）。`,
       { status: 502 },
     );
   }
 
-  return { text, usage, model, provider: providerId, ms: now() - started };
+  return {
+    text,
+    usage,
+    model,
+    provider: providerId,
+    ms: now() - started,
+    toolCalls,
+    finishReason,
+    // 原样的 assistant 消息：工具循环要把这条塞回对话历史。
+    // 必须连 tool_calls 一起带上，否则下一轮模型看不到自己请求过什么。
+    assistantMessage: {
+      role: 'assistant',
+      content: message.content ?? '',
+      ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+    },
+  };
+}
+
+/**
+ * 用给定的 messages + tools 走一遍「降级链 + 重试 + 时间预算」。
+ *
+ * 为什么要把这段抽出来：工具循环每一轮都是一次完整的模型调用，
+ * 它同样需要重试和降级保护（不然一次网络抖动就毁掉整个工具流程）。
+ * 但它的 messages 是**带工具结果的完整对话历史**，不能走 callModel 的
+ * system+user 拼接路径。所以这里提供一个"原样传 messages"的入口。
+ *
+ * 注意：这个函数**不做** schema 校验和 JSON 抢救 —— 工具循环的每一轮
+ * 需要的是"模型说了什么/要调什么工具"，结构化输出去外层做。
+ *
+ * @param {object} opts 见下
+ * @returns {Promise<{text, toolCalls, assistantMessage, usage, ms, provider, model, degraded, notices, attempts, finishReason}>}
+ */
+export async function callModelRaw(opts) {
+  const {
+    messages,
+    tools = null,
+    maxTokens = 4000,
+    temperature = 0.3,
+    timeoutMs = Number(process.env.HANDOFF_LLM_TIMEOUT_MS) || 120000,
+    signal = null,
+    purpose = 'generic',
+    role = '',
+    onNotice = null,
+    onToolTurn = null,
+    deps: injectedDeps = null,
+  } = opts ?? {};
+
+  if (!Array.isArray(messages) || messages.length === 0) {
+    throw new AppError(ERR.BAD_REQUEST, 'callModelRaw 需要非空的 messages 数组。', { status: 500 });
+  }
+
+  const deps = { ...defaultDeps, ...(injectedDeps ?? {}) };
+  const chain = deps.chain ?? resolveChain(deps.env);
+
+  const notices = [];
+  const notice = (text, level = 'warn') => {
+    const item = { level, text, purpose, role, at: now() };
+    notices.push(item);
+    try {
+      onNotice?.(item);
+    } catch {
+      /* 通知失败不影响主流程 */
+    }
+  };
+
+  const budgetMs = opts.budgetMs ?? Math.max(90_000, timeoutMs * 2);
+  const deadline = now() + budgetMs;
+  let lastError = null;
+  let attemptsMade = 0;
+  let budgetExhausted = false;
+  const totalUsage = { promptTokens: 0, completionTokens: 0 };
+  let totalMs = 0;
+
+  for (let ci = 0; ci < chain.length; ci += 1) {
+    const step = chain[ci];
+    const MAX_ATTEMPTS = 2;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+      if (signal?.aborted) throw new AppError(ERR.LLM_ABORTED, '任务已被取消。', { status: 499 });
+      if (now() >= deadline) {
+        budgetExhausted = true;
+        break;
+      }
+      attemptsMade += 1;
+
+      try {
+        onToolTurn?.({ phase: 'request', provider: step.provider, model: step.model, attempt });
+        const res = await callOnce({
+          providerId: step.provider,
+          model: step.model,
+          messages,
+          tools,
+          maxTokens,
+          temperature,
+          timeoutMs,
+          signal,
+          deps,
+        });
+        totalMs += res.ms;
+        totalUsage.promptTokens += res.usage.promptTokens;
+        totalUsage.completionTokens += res.usage.completionTokens;
+
+        return {
+          text: res.text,
+          toolCalls: res.toolCalls ?? [],
+          finishReason: res.finishReason,
+          assistantMessage: res.assistantMessage,
+          usage: res.usage,
+          ms: res.ms,
+          provider: res.provider,
+          providerLabel: PROVIDERS[res.provider]?.label ?? res.provider,
+          model: res.model,
+          degraded: ci > 0,
+          notices,
+          attempts: attemptsMade,
+        };
+      } catch (err) {
+        if (err?.code === ERR.LLM_ABORTED) throw err;
+        // 空正文在工具场景下可能是"模型只想调工具但格式坏了"，
+        // 换一家 provider 往往就好 —— 所以这里也允许重试/降级。
+        lastError = err;
+        if (err?.retriable === false && err?.code !== ERR.LLM_EMPTY_RESPONSE) break;
+        if (attempt < MAX_ATTEMPTS) {
+          const wait = backoffMs(attempt);
+          notice(`${PROVIDERS[step.provider]?.label ?? step.provider} 这次没成功，${Math.round(wait / 1000)} 秒后重试。`);
+          try {
+            await deps.sleep(wait, signal);
+          } catch {
+            throw new AppError(ERR.LLM_ABORTED, '任务已被取消。', { status: 499 });
+          }
+        }
+      }
+    }
+
+    if (ci < chain.length - 1) {
+      notice(`切换到备用模型继续（${PROVIDERS[chain[ci + 1].provider]?.label ?? chain[ci + 1].provider}）。`);
+    }
+  }
+
+  const detail = lastError?.message ? redactSecrets(lastError.message) : '未知原因';
+  const err = new AppError(
+    budgetExhausted ? ERR.LLM_TIMEOUT : ERR.LLM_NO_PROVIDER,
+    budgetExhausted
+      ? `这一步花了太久（超过 ${Math.round(budgetMs / 1000)} 秒）还没拿到结果。最后一次的原因：${detail}`
+      : `所有模型都没能完成任务。最后一次的失败原因：${detail}`,
+    { status: budgetExhausted ? 504 : 503, cause: lastError },
+  );
+  err.attempts = attemptsMade;
+  err.usage = totalUsage;
+  err.ms = totalMs;
+  if (lastError?.raw !== undefined) err.raw = lastError.raw;
+  if (lastError?.details !== undefined) err.details = lastError.details;
+  throw err;
 }
 
 /**

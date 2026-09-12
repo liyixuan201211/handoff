@@ -19,6 +19,9 @@ import { callModel as realCallModel } from '../llm/gateway.js';
 import { AppError, ERR, redactSecrets } from '../llm/errors.js';
 import { events, newId } from '../store/events.js';
 import { isDemoMode } from '../runtime-flags.js';
+import { listTools } from '../tools/registry.js';
+import { callModelWithTools } from '../tools/loop.js';
+import { prepareSkillsForGoal } from '../skills/loader.js';
 import { mapConfidence } from '../llm/schema-check.js';
 
 /**
@@ -96,6 +99,79 @@ export async function loadOptionalDeps() {
     return true;
   })();
   return deps.storeReady;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 工具的展示层辅助
+ * ──────────────────────────────────────────────────────────────── */
+
+/** 工具名 → 用户看得懂的中文说法 */
+const TOOL_LABELS = {
+  web_fetch: '打开一个网页',
+  web_search: '上网搜一下',
+  read_text_file: '读你电脑上的文件',
+};
+
+/**
+ * 给工具起一个用户看得懂的名字。
+ *
+ * 界面上直接显示 `mock__echo` 或 `web_fetch` 对普通人毫无意义 ——
+ * 我们的用户是护士和小店主，不是工程师。MCP 工具带服务前缀，
+ * 所以这里也要处理 `服务名__工具名` 的形式。
+ */
+export function friendlyToolName(name) {
+  const raw = String(name ?? '');
+  if (TOOL_LABELS[raw]) return TOOL_LABELS[raw];
+  const m = raw.match(/^([a-z0-9_]+)__(.+)$/i);
+  if (m) return `${m[1]} 服务的「${m[2].replace(/_/g, ' ')}」`;
+  return raw.replace(/_/g, ' ');
+}
+
+/** 把工具参数说成一句人话（只说最要紧的那个参数） */
+export function describeToolArgs(args) {
+  if (!args || typeof args !== 'object') return '';
+  const v =
+    args.url ?? args.query ?? args.path ?? args.text ?? args.q ?? null;
+  if (typeof v !== 'string' || !v.trim()) return '';
+  const short = v.length > 70 ? `${v.slice(0, 70)}…` : v;
+  return `：${short}`;
+}
+
+/** 本阶段允许用哪些工具（由配置里的 toolStages 决定） */
+function toolsForStage(stageKey) {
+  try {
+    const cfg = toolConfigRef.value;
+    const stages = Array.isArray(cfg?.toolStages) ? cfg.toolStages : ['research', 'draft'];
+    if (!stages.includes(stageKey)) return [];
+    return listTools().map((t) => t.name);
+  } catch {
+    return [];
+  }
+}
+
+/** 工具配置的引用（由 server 在初始化后塞进来，避免 engine 直接依赖配置模块） */
+export const toolConfigRef = { value: null };
+
+/**
+ * 显式设置工具配置。
+ *
+ * 给 server 和**测试**用的唯一入口。
+ * 测试里直接改 `toolConfigRef.value` 也能work，但那样测的是"内部实现"；
+ * 而"哪些阶段能用工具"是我们真正要控制的行为，值得有一个明确的函数，
+ * 顺带把参数校验也做掉（写错了立刻报错，而不是悄悄变成"没有工具"）。
+ *
+ * @param {object|null} cfg { toolStages?:string[], skills?:object, __rootDir?:string }
+ */
+export function setToolConfig(cfg) {
+  if (cfg === null) {
+    toolConfigRef.value = null;
+    return;
+  }
+  if (typeof cfg !== 'object') throw new TypeError('setToolConfig 需要一个对象或 null');
+  if (cfg.toolStages !== undefined && !Array.isArray(cfg.toolStages)) {
+    throw new TypeError('toolStages 必须是字符串数组');
+  }
+  toolConfigRef.value = cfg;
 }
 
 /** 内存兜底存储：store 模块缺失时引擎依然可用（也让引擎能被单测） */
@@ -435,6 +511,17 @@ async function execute(job) {
   let artifacts = Array.isArray(job.artifacts) ? [...job.artifacts] : [];
   const notices = [];
 
+  /**
+   * 技能块：本次任务相关的领域知识，会拼到所有阶段的提示词后面。
+   *
+   * ⚠️ 必须在 try 块**外面**声明。我第一版把它声明在 try 里面，
+   * 出了块就被销毁了，于是每个阶段都在运行时抛 "skillsBlock is not defined" ——
+   * 而且报错位置离真正的原因（作用域）很远，查起来费劲。
+   * 这类"作用域导致的运行时 undefined"是 JS 里最该被警惕的一类 bug：
+   * 语法检查通不过它，单测也可能碰不到，只有真的跑一遍才暴露。
+   */
+  let skillsBlock = '';
+
   /** 当前正在跑的阶段（永远取最后一个，避免索引错位） */
   const currentStage = () => job.stages.at(-1) ?? null;
 
@@ -477,6 +564,117 @@ async function execute(job) {
     // 这条语义在 §4 契约里，stages 那边做了双向兼容，两边改动要保持一致。
   };
 
+  /**
+   * 带工具的模型调用（同样的用量统计 + 事件广播）。
+   *
+   * 每个工具调用都往 SSE 发一对事件（start/end），这样界面上能看到
+   * 「调研员正在打开 example.com…」而不只是一个转圈。
+   * 这是"看得见"这个卖点在工具体系里的延伸 —— 用户必须知道他请的团队
+   * 到底上网干了什么。
+   */
+  const callModelWithToolsWithAccounting = async (opts) => {
+    checkAbort();
+    const started = Date.now();
+    const res = await callModelWithTools({
+      ...opts,
+      signal,
+      jobId: job.id,
+      // 不显式传 deps：让网关用它自己的默认依赖。
+      // 默认依赖里的 fetch 是 `(...a) => globalThis.fetch(...a)` —— 在**调用时**读取，
+      // 所以 `vi.stubGlobal('fetch', ...)` 这类测试注入依然生效。
+      // （曾经为了"把注入传下去"加过一层显式 deps，结果 null 值把默认 fetch 覆盖没了，
+      //   工具路径直接断掉。少一层间接就少一类这类 bug。）
+      onNotice: (n) => {
+        notices.push(n);
+        const st = currentStage();
+        if (st) st.log.push({ at: Date.now(), level: n.level ?? 'warn', text: n.text });
+        emit({
+          type: 'log',
+          stageId: st?.id ?? null,
+          level: n.level ?? 'warn',
+          text: n.text,
+          at: Date.now(),
+        });
+      },
+      onToolCall: (e) => {
+        const st = currentStage();
+        job.toolCalls = job.toolCalls ?? [];
+        if (e.phase === 'start') {
+          // ⚠️ 必须用 currentStage()，不能写 `stage`。
+          // 这段代码在 runOneStage 里时 `stage` 是参数；搬进 execute() 之后
+          // `stage` 就不存在了 —— 而外面那层 `try { } catch { /* 忽略 */ }`
+          // 把它变成了**完全静默**的失败：
+          //   · start 事件一条都发不出去
+          //   · job.toolCalls 永远是空数组
+          //   · 界面上看不到"团队正在用某个工具"
+          // 表现是"功能好像没生效"，但没有任何报错。
+          // 教训：catch 里什么都不做，等于把 bug 藏起来。见下面的 catch。
+          job.toolCalls.push({ name: e.name, args: e.args, at: Date.now(), stageKey: st?.key ?? null });
+          const text = `要用「${friendlyToolName(e.name)}」${describeToolArgs(e.args)}`;
+          if (st) st.log.push({ at: Date.now(), level: 'info', text });
+          emit({
+            type: 'tool',
+            stageId: st?.id ?? null,
+            phase: 'start',
+            name: e.name,
+            label: friendlyToolName(e.name),
+            args: e.args,
+            at: Date.now(),
+          });
+          emit({ type: 'log', stageId: st?.id ?? null, level: 'info', text, at: Date.now() });
+        } else {
+          const last = [...(job.toolCalls ?? [])].reverse().find((x) => x.name === e.name && !x.ms);
+          if (last) {
+            last.ms = e.ms;
+            last.status = e.status;
+            last.summary = e.summary;
+          }
+          const text =
+            e.status === 'ok'
+              ? `「${friendlyToolName(e.name)}」拿到了结果（${Math.round((e.ms ?? 0) / 100) / 10} 秒）`
+              : `「${friendlyToolName(e.name)}」没成功：${e.error ?? '未知原因'}`;
+          if (st) st.log.push({ at: Date.now(), level: e.status === 'ok' ? 'info' : 'warn', text });
+          emit({
+            type: 'tool',
+            stageId: st?.id ?? null,
+            phase: 'end',
+            name: e.name,
+            label: friendlyToolName(e.name),
+            status: e.status,
+            ms: e.ms,
+            summary: e.summary,
+            error: e.error,
+            at: Date.now(),
+          });
+          emit({
+            type: 'log',
+            stageId: st?.id ?? null,
+            level: e.status === 'ok' ? 'info' : 'warn',
+            text,
+            at: Date.now(),
+          });
+        }
+      },
+    });
+
+    job.usage.calls += 1;
+    job.usage.promptTokens += res.usage?.promptTokens ?? 0;
+    job.usage.completionTokens += res.usage?.completionTokens ?? 0;
+    job.usage.ms += Date.now() - started;
+    job.usage.toolCalls = (job.usage.toolCalls ?? 0) + (res.toolCount ?? 0);
+    if (res.degraded) {
+      const st = currentStage();
+      emit({
+        type: 'log',
+        stageId: st?.id ?? null,
+        level: 'warn',
+        text: `主模型繁忙，已自动切换到备用模型继续。`,
+        at: Date.now(),
+      });
+    }
+    return res;
+  };
+
   /* 阶段 1：intake（必需，先跑，因为它的产出决定了后面的编排） */
   const intakeStage = job.stages.find((s) => s.key === 'intake');
   const intakeOut = await runOneStage({
@@ -486,6 +684,9 @@ async function execute(job) {
     outputs,
     artifacts,
     callModel: callModelWithAccounting,
+    callModelWithTools: callModelWithToolsWithAccounting,
+    skillsBlock,
+    toolsForStage,
     emit,
     checkAbort,
     save,
@@ -528,6 +729,9 @@ async function execute(job) {
     outputs,
     artifacts,
     callModel: callModelWithAccounting,
+    callModelWithTools: callModelWithToolsWithAccounting,
+    skillsBlock,
+    toolsForStage,
     emit,
     checkAbort,
     save,
@@ -592,6 +796,9 @@ async function execute(job) {
         outputs,
         artifacts,
         callModel: callModelWithAccounting,
+        callModelWithTools: callModelWithToolsWithAccounting,
+        skillsBlock,
+        toolsForStage,
         emit,
         checkAbort,
         save,
@@ -746,6 +953,17 @@ async function runOneStage({
   outputs,
   artifacts,
   callModel,
+  // ⚠️ 必须在签名里显式接住它。
+  // 之前的写法是在下面直接引用 `callModelWithToolsWithAccounting`，
+  // 但那个函数定义在 `execute()` 的**闭包里**，而 runOneStage 是**顶层函数** ——
+  // 于是每次调用都抛 "callModelWithToolsWithAccounting is not defined"，
+  // 所有任务在第一个阶段就失败。这类错误编译器本该抓到，
+  // 但 JS 的模块作用域 + 闭包让它变成了运行时错误。
+  callModelWithTools,
+  // 技能块（本次任务相关的领域知识）与阶段级工具白名单。
+  // 它们都在 execute() 里算好，通过参数传进来 —— 顶层函数不能引用闭包变量。
+  skillsBlock,
+  toolsForStage,
   emit,
   checkAbort,
   save,
@@ -807,6 +1025,10 @@ async function runOneStage({
       outputs,
       artifacts,
       callModel,
+      // 带工具的调用入口 + 本阶段允许用哪些工具
+      callModelWithTools,
+      toolsAvailable: toolsForStage(key),
+      skillsBlock,
       log,
       emit,
       checkAbort,

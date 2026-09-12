@@ -132,11 +132,39 @@ const extraRequirements = (userMessages = []) => {
  *
  * 兜底：万一模型还是输出了 JSON（它有时很固执），这里也认。
  */
+/**
+ * 把技能块拼到 system 提示词后面。
+ *
+ * 为什么每个阶段都要带：技能是"这类事该怎么做的经验"，
+ * 接待员理解需求时用得上（知道这类事的关键点在哪），
+ * 执行专员写的时候更用得上，质检员验收时也用得上（知道该查什么）。
+ * 全部阶段统一注入，比挑几个阶段注入更不容易出错。
+ */
+const sysWith = (system, ctx) => `${system}${ctx?.skillsBlock ?? ''}`;
+
 async function callForArtifacts(ctx, { system, user, maxTokens, purpose, role, temperature }) {
   const stageTimeout = timeoutFor(purpose);
-  const runOnce = (extra = '') =>
-    ctx.callModel({
-      system: `${system}\n\n${ARTIFACT_PROTOCOL_SPEC}${extra}`,
+  // 「动手做」允许用工具：写东西之前先查一下、把用户的文件读一遍，
+  // 产出物的质量差别很大。只在真的有工具时才走这条路。
+  const useTools = ctx.toolsAvailable && ctx.toolsAvailable.length > 0;
+
+  const runOnce = (extra = '') => {
+    const sys = sysWith(`${system}\n\n${ARTIFACT_PROTOCOL_SPEC}${extra}`, ctx);
+    if (useTools) {
+      return ctx.callModelWithTools({
+        system:
+          sys +
+          '\n\n【你这次可以使用工具】在动笔之前，如果有需要核实的事实、' +
+          '用户提到的文件或链接，**先用工具查清楚**再写。查不到的部分如实说明，不要编。',
+        user,
+        allowedTools: ctx.toolsAvailable,
+        maxTokens,
+        purpose,
+        role,
+      });
+    }
+    return ctx.callModel({
+      system: sys,
       user,
       schema: null,
       maxTokens,
@@ -145,6 +173,7 @@ async function callForArtifacts(ctx, { system, user, maxTokens, purpose, role, t
       temperature,
       timeoutMs: stageTimeout,
     });
+  };
 
   let res = await runOnce();
   let text = resText(res);
@@ -288,11 +317,70 @@ function synthesizeDelivery(ctx, err) {
   };
 }
 
+/**
+ * 把"用了工具的研究阶段"的自由文本产出，抽成结构化的 findings/sources/cautions。
+ *
+ * 为什么需要兜底：带工具时我们不再强制 JSON schema（模型要一边调工具一边输出
+ * 严格 JSON 很别扭，失败率很高）。所以它可能给散文、可能给 JSON、可能给混搭。
+ * **无论哪种，查到的东西都不能丢** —— 这是这个函数存在的唯一理由。
+ *
+ * @param {string} text 模型最终正文
+ * @param {Array} steps 工具调用轨迹（用来兜底：至少告诉下游"查了什么"）
+ */
+export function salvageResearch(text, steps = []) {
+  const src = String(text ?? '').trim();
+
+  // 情形一：它还是给了 JSON（有些模型很固执）
+  const jsonGuess = extractJsonObject(src);
+  if (jsonGuess && Array.isArray(jsonGuess.findings)) {
+    return {
+      findings: jsonGuess.findings.map((f) => String(f)).filter(Boolean).slice(0, 12),
+      sources: Array.isArray(jsonGuess.sources) ? jsonGuess.sources.map(String).slice(0, 8) : [],
+      cautions: Array.isArray(jsonGuess.cautions) ? jsonGuess.cautions.map(String).slice(0, 8) : [],
+      _protocol: 'json',
+    };
+  }
+
+  if (!src) {
+    // 一句话都没写出来，但工具确实跑过：至少把"查了什么"记下来
+    return {
+      findings: steps.length
+        ? [`（这一步调用了 ${steps.length} 次工具，但没能整理出结论）`]
+        : [],
+      sources: steps.map((s) => `${s.name}(${JSON.stringify(s.args ?? {}).slice(0, 80)})`).slice(0, 8),
+      cautions: ['这一步没能整理出结论，交付物里应说明部分信息未能核实。'],
+      _protocol: 'empty',
+    };
+  }
+
+  // 情形二：散文。按标题/列表切段，尽量把要点提出来。
+  const findings = [];
+  for (const block of src.split(/\n\s*\n/)) {
+    const cleaned = block
+      .split('\n')
+      .map((l) => l.replace(/^\s*(?:[-*·]|\d+[.、)]|#{1,6})\s*/, '').trim())
+      .filter(Boolean)
+      .join(' ');
+    if (cleaned.length > 8) findings.push(cleaned);
+  }
+
+  // 把明显是"提醒/注意"的段落单独挑出来当 cautions
+  const cautions = findings.filter((f) => /^注意|小心|警惕|风险|不确定|未能/.test(f)).slice(0, 6);
+  const pure = findings.filter((f) => !cautions.includes(f));
+
+  return {
+    findings: (pure.length ? pure : findings).slice(0, 12),
+    sources: steps.map((s) => `${s.name}${s.summary ? `：${s.summary.slice(0, 60)}` : ''}`).slice(0, 8),
+    cautions,
+    _protocol: 'prose',
+  };
+}
+
 export const STAGE_RUNNERS = {
   async intake(ctx) {
     const out = await ctx.callModel({
       timeoutMs: timeoutFor('intake'),
-      system: systemPromptFor('intake'),
+      system: sysWith(systemPromptFor('intake'), ctx),
       user: buildUser.intake({
         goal: ctx.goal,
         audience: ctx.job.audience,
@@ -314,7 +402,7 @@ export const STAGE_RUNNERS = {
   async plan(ctx) {
     const out = await ctx.callModel({
       timeoutMs: timeoutFor('plan'),
-      system: systemPromptFor('plan'),
+      system: sysWith(systemPromptFor('plan'), ctx),
       user:
         buildUser.plan({ goal: ctx.goal, intake: ctx.outputs.intake }) +
         extraRequirements(ctx.job.userMessages),
@@ -329,9 +417,34 @@ export const STAGE_RUNNERS = {
   },
 
   async research(ctx) {
+    // 有工具时，「查资料」才是名副其实的查资料 —— 不然它只是"凭记忆写"。
+    // 实测：给它 read_text_file/web_fetch/web_search 之后，它会把用户提到的
+    // 文件真的读一遍、把用户给的链接真的打开，而不是猜。
+    const useTools = ctx.toolsAvailable && ctx.toolsAvailable.length > 0;
+    if (useTools) {
+      const r = await ctx.callModelWithTools({
+        system:
+          sysWith(systemPromptFor('research'), ctx) +
+          '\n\n【你这次可以使用工具】如果用户提到了某个文件或某个链接，' +
+          '**先用工具真的去读/去查**，不要凭印象猜。查到的东西才写进 findings，' +
+          '并说明来源。查不到就如实说查不到。',
+        user: buildUser.research({ goal: ctx.goal, plan: ctx.plan }),
+        allowedTools: ctx.toolsAvailable,
+        maxTokens: MAX_TOKENS.research,
+        purpose: 'research',
+        role: TEAM.research.role,
+      });
+      // 工具跑完后的正文可能是散文，抽成结构化 findings；抽不出来就用原文兜底 ——
+      // 绝不因为"格式没按要求"就把查到的东西丢掉。
+      const salvaged = salvageResearch(r.text, r.steps);
+      ctx.log(`补齐了 ${salvaged.findings.length} 条背景知识${r.toolCount ? `（用了 ${r.toolCount} 次工具）` : ''}`);
+      for (const c of salvaged.cautions ?? []) ctx.log(`  注意：${c}`, 'warn');
+      return salvaged;
+    }
+
     const out = await ctx.callModel({
       timeoutMs: timeoutFor('research'),
-      system: systemPromptFor('research'),
+      system: sysWith(systemPromptFor('research'), ctx),
       user: buildUser.research({ goal: ctx.goal, plan: ctx.plan }),
       schema: SCHEMAS.research,
       maxTokens: MAX_TOKENS.research,
@@ -345,7 +458,7 @@ export const STAGE_RUNNERS = {
 
   async draft(ctx) {
     const out = await callForArtifacts(ctx, {
-      system: systemPromptFor('draft'),
+      system: sysWith(systemPromptFor('draft'), ctx),
       user:
         buildUser.draft({
           goal: ctx.goal,
@@ -395,7 +508,7 @@ export const STAGE_RUNNERS = {
   async revise(ctx) {
     const issues = ctx.outputs.critique?.issues ?? [];
     const out = await callForArtifacts(ctx, {
-      system: systemPromptFor('revise'),
+      system: sysWith(systemPromptFor('revise'), ctx),
       user: buildUser.revise({
         goal: ctx.goal,
         plan: ctx.plan,
@@ -416,7 +529,7 @@ export const STAGE_RUNNERS = {
   async verify(ctx) {
     const out = await ctx.callModel({
       timeoutMs: timeoutFor('verify'),
-      system: systemPromptFor('verify'),
+      system: sysWith(systemPromptFor('verify'), ctx),
       user: buildUser.verify({
         goal: ctx.goal,
         plan: { ...ctx.plan, intent: ctx.outputs.intake?.intent },
@@ -442,7 +555,7 @@ export const STAGE_RUNNERS = {
     try {
       out = await ctx.callModel({
       timeoutMs: timeoutFor('deliver'),
-      system: systemPromptFor('deliver'),
+      system: sysWith(systemPromptFor('deliver'), ctx),
       user: buildUser.deliver({
         goal: ctx.goal,
         plan: ctx.plan,

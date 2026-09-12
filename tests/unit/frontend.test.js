@@ -741,6 +741,8 @@ describe('CSS 一致性：新加的类名必须在 styles.css 里有定义', () 
     'tpl-grid',
     'demo-note',
     'demo-note-text',
+    'log-icon',
+    'log-line-tool',
     'tpl-title',
     'tpl-desc',
   ];

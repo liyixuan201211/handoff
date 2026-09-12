@@ -16,6 +16,8 @@ import { ERR, AppError, toPublicError, redactSecrets } from './llm/errors.js';
 import { inspectChain } from './llm/providers.js';
 import * as store from './store/json-store.js';
 import { isDemoMode } from './runtime-flags.js';
+import { initToolSystem, shutdownToolSystem, toolSystemSummary, toolSystemState } from './tools/bootstrap.js';
+import { toolConfigRef } from './pipeline/engine.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT_DIR = path.resolve(HERE, '..');
@@ -190,6 +192,9 @@ async function healthPayload() {
     jobs,
     // 让用户（和排查问题的人）一眼知道现在是不是离线演示模式
     demoMode: isDemoMode(),
+    // 工具体系状态：开了哪些工具、接了什么 MCP、加载了几个技能。
+    // describeConfig 里已经把 apiKey 之类过滤成"有没有配"的布尔值，不会泄漏密钥。
+    tools: toolSystemSummary(),
     // 注意字段命名：不要含 "key" 字样 —— 安全测试会用 /"key"/ 扫整个响应体，
     // 字段名撞上就会误报"密钥泄漏"。命名也是安全边界的一部分。
     modelPlan: models.map((m) => `${m.provider}/${m.model}`),
@@ -376,6 +381,13 @@ export async function startServer({
   installProcessGuards();
   await store.loadFromDisk();
   store.startSyncTimer();
+
+  // 工具体系：读配置、注册原生工具、接 MCP、加载技能。
+  // 它内部已经保证"任何失败都只是少一个能力"，不会抛出来挡住启动。
+  await initToolSystem({ rootDir: ROOT_DIR });
+  // 把配置交给引擎（引擎不直接依赖配置模块，避免循环依赖）
+  toolConfigRef.value = { ...toolSystemState.__config, __rootDir: ROOT_DIR };
+  for (const w of toolSystemState.warnings) console.warn(`[tools] ${w}`);
   // 崩溃恢复：上次进程被强杀时，正在跑的任务会永远停在 running，
   // 用户看到的是一个**永远不会再往前走**的进度条 —— 比报错更糟，因为他会一直等。
   // 启动时把这些任务标成 interrupted，并给出能看懂的解释和重试入口。
@@ -405,6 +417,35 @@ export async function startServer({
 /** 只有被直接执行时才真的监听端口 */
 const invokedDirectly =
   process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+/**
+ * 退出前把工具系统关掉。
+ *
+ * 为什么必须有：MCP 的 stdio 服务是**我们拉起来的子进程**。
+ * 不显式关闭的话，用户按 Ctrl+C 之后会留下一堆 npx/node 孤儿进程 ——
+ * 他下次打开活动监视器会发现"这东西怎么还在跑"，对开源项目的信任就是这样丢掉的。
+ */
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    console.log(`[server] 收到 ${signal}，正在退出…`);
+    await shutdownToolSystem();
+  } catch (err) {
+    console.warn(`[server] 退出清理时出错（忽略）：${err?.message ?? err}`);
+  }
+}
+
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => {
+    gracefulShutdown(sig).finally(() => process.exit(0));
+  });
+}
+// 'exit' 里不能 await（同步上下文），但 close 是尽力而为的同步触发
+process.on('exit', () => {
+  shutdownToolSystem().catch(() => {});
+});
 
 if (invokedDirectly) {
   startServer().catch((err) => {

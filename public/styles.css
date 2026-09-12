@@ -154,6 +154,16 @@ button { font: inherit; color: inherit; }
 }
 .tpl-hint-tips { margin: 0; color: var(--text-2); font-size: .9rem; line-height: 1.7; }
 
+/* 工具调用日志：加个图标让它从普通日志里跳出来。
+   用户需要一眼看到"团队上网查东西了"—— 那是对外界的动作。 */
+.log-icon {
+  flex: 0 0 auto;
+  margin-right: var(--sp-1);
+  font-size: .95em;
+  line-height: 1;
+}
+.log-line-tool .log-text { font-weight: 500; }
+
 /* 演示模式提示条：明说"这是样例，跟你的问题无关"。
    不写清楚的话，用户会以为产品答非所问 —— 那比不做演示还糟。 */
 .demo-note {
