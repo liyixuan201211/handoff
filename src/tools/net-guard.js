@@ -120,7 +120,17 @@ const BLOCKED_HOSTNAMES = new Set([
  * @returns {Promise<{ok:boolean, url?:URL, error?:string, resolvedIp?:string}>}
  */
 export async function checkUrl(rawUrl, opts = {}) {
-  const { allowHosts = [], allowPrivateHosts = false } = opts;
+  const {
+    allowHosts = [],
+    allowPrivateHosts = false,
+    // 可注入的 DNS 解析器（测试用）。
+    // 为什么需要：我们的测试要断言"公网域名放行、解析到内网的域名拦下"，
+    // 而这两件事都取决于**这台机器当下的 DNS**。
+    // 实测踩到过：某台开发机的 DNS 会把 example.com 解析成 127.0.0.1，
+    // 于是"公网地址应该放行"这条测试无缘无故就红了 —— 而代码完全没问题。
+    // 靠真实 DNS 的测试是 flaky 测试，必须能注入。
+    dnsLookup = (host) => dns.lookup(host, { all: true, verbatim: true }),
+  } = opts;
 
   let url;
   try {
@@ -185,7 +195,7 @@ export async function checkUrl(rawUrl, opts = {}) {
     // （所谓 DNS rebinding 的简化版）。
     let addresses;
     try {
-      addresses = await dns.lookup(host, { all: true, verbatim: true });
+      addresses = await dnsLookup(host);
     } catch {
       return { ok: false, error: `解析不了这个域名：${host}` };
     }

@@ -120,9 +120,43 @@ describe('URL 闸门：这些必须被拒绝', () => {
   });
 
   it('公网地址正常放行（不能误伤）', async () => {
-    const r = await checkUrl('https://example.com/');
+    // ⚠️ 注入 DNS：不能依赖这台机器当下的解析结果。
+    // 实测踩到过：某台开发机的 DNS 会把 example.com 解析成 127.0.0.1，
+    // 于是这条测试无缘无故红了，而代码完全没问题。
+    const r = await checkUrl('https://example.com/', {
+      dnsLookup: async () => [{ address: '93.184.216.34', family: 4 }],
+    });
     expect(r.ok).toBe(true);
     expect(r.url.hostname).toBe('example.com');
+  });
+
+  it('域名解析到内网 → 拦下（DNS rebinding 的简化版）', async () => {
+    // 攻击者可以注册一个解析到 127.0.0.1 的域名来绕过纯字符串检查。
+    // 所以必须解析后检查**真实 IP**，不能只看域名。
+    const r = await checkUrl('https://evil-looks-public.com/', {
+      dnsLookup: async () => [{ address: '127.0.0.1', family: 4 }],
+    });
+    expect(r.ok, '解析到回环的域名必须被拦').toBe(false);
+    expect(r.error).toContain('内网');
+  });
+
+  it('域名解析到多个地址时，只要有一个是内网就拦（不能只看第一个）', async () => {
+    const r = await checkUrl('https://mixed.example/', {
+      dnsLookup: async () => [
+        { address: '93.184.216.34', family: 4 },
+        { address: '10.0.0.5', family: 4 },
+      ],
+    });
+    expect(r.ok, '多地址里混了内网 IP 也必须拦').toBe(false);
+  });
+
+  it('DNS 解析失败 → 拦下（不猜、不放行）', async () => {
+    const r = await checkUrl('https://nowhere.invalid/', {
+      dnsLookup: async () => {
+        throw Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' });
+      },
+    });
+    expect(r.ok).toBe(false);
   });
 
   it('allowPrivateHosts=true 才允许内网（显式开关）', async () => {
