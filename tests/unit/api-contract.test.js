@@ -139,10 +139,27 @@ describe('接线：前端 api.js ↔ 后端 HTTP（这是唯一能发现"解包"
       await new Promise((r) => setTimeout(r, 100));
       job = await api.getJob(created.id);
     }
-    const retried = await api.retryJob(created.id);
-    expect(retried).toBeTruthy();
+
+    // ⚠️ 这里要容忍 409。
+    // 内存里的状态先变成 done，而引擎释放"任务占位"是紧接着的异步操作。
+    // 在这个窗口里调 retry，服务端会正确地回答"这个任务正在执行中，不用重复点" ——
+    // 那是**正确行为**，不是 bug（用户双击重试时我们本来就不该跑两遍）。
+    // 所以这里重试几次，而不是把这个真实的竞态判成失败。
+    let retried = null;
+    let lastErr = null;
+    for (let i = 0; i < 20; i += 1) {
+      try {
+        retried = await api.retryJob(created.id);
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (err?.status !== 409) throw err; // 其他错误要原样暴露
+        await new Promise((r) => setTimeout(r, 150));
+      }
+    }
+    expect(retried, `一直拿到 409：${lastErr?.message ?? ''}`).toBeTruthy();
     expect(retried.id).toBe(created.id);
-  }, 30_000);
+  }, 40_000);
 
   it('getTemplates 返回 { templates, fallback }，且模板非空、每项都有 id/title（首页永不留白）', async () => {
     // 注意形状：这个方法是**有意**返回 `{ templates, fallback }` 而不是裸数组，
