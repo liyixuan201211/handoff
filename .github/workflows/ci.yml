@@ -52,11 +52,35 @@ jobs:
 
       - name: 检查有没有把密钥提交进来
         run: |
-          # 真实的密钥形态（故意用不会匹配到测试里假 key 的模式）
-          if git grep -nE '(AIPING|DEEPSEEK|OPENAI|ANTHROPIC)_API_KEY=[^[:space:]]{10,}' -- . ':!*.example*' ':!.github/*'; then
-            echo "❌ 疑似真实密钥被提交"; exit 1
+          set -e
+          PATTERN='(AIPING|DEEPSEEK|OPENAI|ANTHROPIC)_API_KEY="?[^"$[:space:]]{20,}'
+
+          # ── 第 0 步：先自检扫描器本身 ──────────────────────────────
+          # 为什么必须有这一步：如果正则写错（匹配不到任何东西），
+          # 这个检查会**永远通过** —— 一个永远绿灯的安全检查比没有检查更糟，
+          # 因为它会让人以为自己被保护着。
+          # 这里用一个已知的坏字串验证正则真的能抓到。
+          probe=$(mktemp)
+          printf 'AIPING_API_KEY=QC-0000000000000000000000000000000000000000000000000000000000\n' > "$probe"
+          if ! grep -qE "$PATTERN" "$probe"; then
+            echo "❌ 密钥扫描器失效了（正则匹配不到已知的坏字串）—— 请修 scripts 里的正则"
+            rm -f "$probe"; exit 1
           fi
+          rm -f "$probe"
+          echo "✅ 扫描器自检通过"
+
+          # ── 第 1 步：扫真实的环境变量赋值 ──────────────────────────
+          # 注意：正则要求值**不是变量引用**（排除了 `$`），
+          # 否则文档里演示"怎么做泄漏测试"的
+          #     AIPING_API_KEY="$FAKEKEY"
+          # 会被误判成真密钥 —— 一开始就是这么误报的。
+          if git grep -nE "$PATTERN" -- . ':!*.example*' ':!.github/*'; then
+            echo "❌ 疑似真实密钥被提交（上面这些行）"; exit 1
+          fi
+
+          # ── 第 2 步：扫 JSON 里被填过的 key 字段 ───────────────────
           if git grep -nE '"key"[[:space:]]*:[[:space:]]*"(QC|sk)-[A-Za-z0-9-]{16,}"' -- . ':!tests/*'; then
-            echo "❌ 疑似真实密钥被提交"; exit 1
+            echo "❌ 疑似真实密钥被提交（上面这些行）"; exit 1
           fi
+
           echo "✅ 没发现密钥"
