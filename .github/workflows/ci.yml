@@ -34,6 +34,16 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
+      - name: 确认没有把密钥类文件提交进来
+        run: |
+          set -e
+          for f in .env handoff.config.json; do
+            if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              echo "❌ $f 被提交进仓库了（它应该只存在于本地）"; exit 1
+            fi
+          done
+          echo "✅ .env 与个人配置都未被跟踪"
+
       - name: 跑全部测试（不调真实模型）
         run: npm test
         env:
@@ -43,6 +53,23 @@ jobs:
 
       - name: 端到端冒烟（离线演示模式）
         run: node scripts/smoke.js
+
+      - name: 从零克隆也能跑通（模拟贡献者的第一次体验）
+        run: |
+          # 这一条验的是**别人的第一次体验**：clone 下来、装依赖、跑测试。
+          # 加它是因为我第一次推送后发现：在自己机器上"全绿"不代表别人能跑起来
+          # （本地有 API Key、有 Cherry Studio 配置、有历史 data/ 目录）。
+          # 这里明确清掉这些，只留一个干净的仓库。
+          set -e
+          WORK=$(mktemp -d)
+          git archive HEAD | tar -x -C "$WORK"
+          cd "$WORK"
+          npm install --silent
+          # 刻意不设任何 API Key，并用一个不存在的 HOME —— 
+          # 这样就不会读到贡献者本机的任何配置
+          HOME="$WORK/fake-home" npx vitest run --reporter=dot
+          HOME="$WORK/fake-home" node scripts/smoke.js
+          echo "✅ 干净克隆可以跑通"
 
       - name: 检查有没有 JSON 语法错误
         run: |

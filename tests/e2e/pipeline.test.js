@@ -575,8 +575,19 @@ describe('C. 失败与边界（最容易出 bug 的地方）', () => {
         if (j && j.status !== 'running' && j.status !== 'queued') break;
         await new Promise((r) => setTimeout(r, 100));
       }
-      await new Promise((r) => setTimeout(r, 400));
-      return request(app).post(`/api/jobs/${id}/message`).send(body);
+      // ⚠️ 用**重试**而不是"固定 sleep 400ms"。
+      // 原因：内存里的状态先变成 done，而引擎释放"任务占位"是紧随其后的异步操作。
+      // 在这个窗口里发 message，服务端会正确地回答 409（任务还在跑）——
+      // 那是**正确行为**，不是缺陷。全仓并行跑时这个窗口会被撑大，
+      // 固定 sleep 偶尔就不够 → 随机失败（实测约 1/6 的概率）。
+      // 所以这里轮询到服务端真的接受为止。
+      let res = null;
+      for (let i = 0; i < 30; i += 1) {
+        res = await request(app).post(`/api/jobs/${id}/message`).send(body);
+        if (res.status !== 409) return res;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      return res;
     };
 
     expect((await send({ message: '再补一句' })).status).toBe(200); // 前端用的名字

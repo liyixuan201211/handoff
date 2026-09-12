@@ -59,12 +59,24 @@ function makeBridgeFetch() {
   };
 }
 
-const api = createApi({ fetchImpl: makeBridgeFetch(), origin: '' });
+/**
+ * ⚠️ api 必须在 beforeAll **里面**建。
+ *
+ * 原来它写在模块顶层，而 `app` 是 beforeAll 里才赋值的 ——
+ * 于是 `supertest(undefined)` 会报「连接不上服务」。
+ * 大多数时候恰好能过（因为第一次请求发生时 app 已经赋值了），
+ * 但和别的测试文件并行跑时偶尔会在赋值之前就发请求 → 随机失败。
+ *
+ * 这类"模块顶层做了依赖后面才赋值的初始化"是 flaky 测试的经典来源：
+ * 它不报语法错、不报引用错，只是**偶尔**失败。
+ */
+let api;
 
 beforeAll(async () => {
   app = createApp({ rateLimit: false });
   server = null;
   origin = '';
+  api = createApi({ fetchImpl: makeBridgeFetch(), origin: '' });
 });
 
 afterAll(() => {
