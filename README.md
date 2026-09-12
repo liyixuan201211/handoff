@@ -63,6 +63,88 @@
 
 ---
 
+## 它真的会动手（工具 / MCP / 技能）
+
+不是只会写字。**你可以让它上网查、读你的文件、接外部工具服务。**
+
+但要先说清楚一件事：
+
+> **所有工具默认都是关的。**
+
+这不是偷懒。一个刚 clone 下来就能替你抓任意网页、读任意文件、拉起任意进程的程序，
+不是一个可以负责任地开源的程序。所以开什么，得你自己写下来：
+
+```bash
+cp handoff.config.example.json handoff.config.json
+# 把要用的能力改成 enabled: true
+```
+
+### 内置的三个工具
+
+| 工具 | 作用 |
+|---|---|
+| `web_fetch` | 打开一个网页，读它的正文 |
+| `web_search` | 上网搜一下（配了搜索 API 才稳） |
+| `read_text_file` | 读你电脑上的文本文件（要列白名单目录） |
+
+**它们带着代码级的防线，不是靠提示词：**
+
+* 挡住回环、内网、**云服务元数据**（`169.254.169.254`，SSRF 的头号目标）
+* 挡住 IPv6 变体、十进制/十六进制 IP、`file://` 协议、带凭据的网址
+* 文件只能读白名单目录里的，符号链接和 `..` 都跳不出去
+* 抓回来的内容会标明"这是数据不是指令"，防间接提示词注入
+
+> 我们的测试里有一整个文件专门在攻击这些防线（`tests/unit/tools-security.test.js`）。
+> 写的时候真抓到两个绕过：`http://[::1]/` 和 `http://[::ffff:127.0.0.1]/`
+> （Node 会把它规范成 `[::ffff:7f00:1]`，靠字符串匹配认不出来）。两个都修了，也钉了测试。
+
+### MCP —— 接上别人的工具服务
+
+支持 [MCP](https://modelcontextprotocol.io/)，能接浏览器自动化、数据库、GitHub 之类的现成服务：
+
+```json
+{
+  "mcp": {
+    "enabled": true,
+    "servers": {
+      "browser": { "type": "stdio", "command": "npx", "args": ["-y", "某个浏览器-mcp"], "enabled": true },
+      "remote":  { "type": "http",  "url": "https://my-mcp.example.com/mcp" }
+    }
+  }
+}
+```
+
+`stdio` 类型**必须**同时写 `enabled: true` —— 它会在你机器上执行命令，
+配置文件里出现一行不该等于"自动执行"。退出时会主动关掉这些子进程，不留孤儿。
+
+### Skill —— 教它"这类事该怎么做"
+
+技能就是一份 markdown。**这是刻意的**：领域知识最好由懂那件事的人写，
+而一个护士会写 markdown，不会写代码。
+
+```markdown
+---
+name: 合同审查
+description: 审查各类合同，找出对当事人不利的条款
+when: 用户要审合同、协议、条款
+---
+
+## 审查合同的经验
+1. 先定位角色（同一份合同，房东和租客的结论完全不同）
+2. 必看的五个地方：钱、退、改、责、证
+...
+```
+
+放在 `skills/<名字>/SKILL.md` 就会自动被用上 ——
+系统会按你的任务挑相关的技能（中文用二元组匹配，不是按单字，
+否则"的/了/一"会让每个技能都命中，筛选等于没筛）。
+
+**想贡献？写技能是最欢迎的一种方式。**见 `CONTRIBUTING.md`。
+
+详细说明在 **`docs/TOOLS.md`**。
+
+---
+
 ## 怎么用起来
 
 ### 你需要什么
@@ -151,7 +233,9 @@ deepseek-flash → aiping/DeepSeek-V4-Flash → aiping/DeepSeek-V4.1-Flash → a
 
 | 文档 | 内容 |
 |---|---|
+| `docs/TOOLS.md` | 工具、MCP、技能怎么配 |
 | `docs/PLAYBOOK.md` | 场景化使用指南：什么需求怎么说效果最好 |
+| `CONTRIBUTING.md` | 想贡献？从这里开始（写技能门槛最低） |
 | `docs/ARCHITECTURE.md` | 架构与设计决策 |
 | `docs/SECURITY.md` | 安全说明（写给普通人，不是术语堆砌） |
 | `docs/TESTING.md` | 怎么跑测试、测了什么、哪里没测 |
@@ -163,11 +247,16 @@ deepseek-flash → aiping/DeepSeek-V4-Flash → aiping/DeepSeek-V4.1-Flash → a
 ## 开发
 
 ```bash
-npm test                    # 全部测试
+npm test                    # 全部测试（不调真实模型、不需要 Key）
 npm run test:unit           # 单元测试
 npm run test:e2e            # 端到端（含离线演示模式）
+node scripts/smoke.js       # 冒烟（5 秒）
 node scripts/dry-run.js     # 真跑一次完整流水线（需要网络 + Key）
+node scripts/bench.js       # 性能基准
 ```
+
+**测试套件不需要 API Key、不需要 Cherry Studio、不调真实模型。**
+clone 下来就能跑绿 —— 这是我们刻意维持的。
 
 `scripts/dry-run.js` 会真的调用模型、真的跑完 8 个阶段、打印每一份交付物的开头，
 最后按 `docs/CONTRACT.md` §7 的验收标准逐条打勾。想确认"它到底能不能干活"就跑这个。
@@ -178,7 +267,8 @@ node scripts/dry-run.js     # 真跑一次完整流水线（需要网络 + Key�
 
 - **Node.js + Express，零框架前端。**没有构建步骤，`git clone` 完就能跑。
   对一个人维护的项目来说，少一层构建就少一类故障。
-- **只有 3 个直接依赖**（express / vitest / supertest），运行期其实只有 express 一个。
+- **直接依赖很少**：运行期只有 `express` 和 `@modelcontextprotocol/sdk`
+  （后者只在你要用 MCP 时才真正加载）；开发期是 `vitest` 和 `supertest`。
   安全面越小越好，也便于你审计我们到底干了什么。
   （`npm install` 会拉进约 120 个传递依赖——那是 express 和 vitest 自己的依赖树，
   不是我们选的。`package.json` 里就那三行。）

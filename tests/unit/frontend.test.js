@@ -861,3 +861,84 @@ describe('SSE 协议事件：前端必须处理 resync 与 closed', () => {
     expect(src).toContain('renderLoadFailure');
   });
 });
+
+
+/* ================================================================== *
+ * 开源就绪检查
+ *
+ * 这些不是"功能测试"，是"这个仓库能不能被别人 clone 下来直接用"的检查。
+ * 开源项目最常见的翻车方式不是功能坏了，是：
+ *   · 贡献者 clone 下来发现跑不起来
+ *   · 文档说 A、实际做 B
+ *   · 不小心把密钥提交了
+ * ================================================================== */
+describe('开源就绪：必需的文档与文件都在', () => {
+  const root = process.cwd();
+  const mustExist = [
+    'LICENSE',
+    'README.md',
+    'CONTRIBUTING.md',
+    '.env.example',
+    'handoff.config.example.json',
+    '.github/workflows/ci.yml',
+    'docs/TOOLS.md',
+    'docs/CONTRACT.md',
+    'docs/ARCHITECTURE.md',
+    'docs/SECURITY.md',
+    'docs/TESTING.md',
+  ];
+  for (const f of mustExist) {
+    it(`${f} 存在`, () => {
+      expect(fs.existsSync(path.join(root, f)), `${f} 不见了`).toBe(true);
+    });
+  }
+
+  it('LICENSE 是 MIT 且不含占位符', () => {
+    const lic = fs.readFileSync(path.join(root, 'LICENSE'), 'utf8');
+    expect(lic).toContain('MIT License');
+    expect(lic).not.toMatch(/\[year\]|\[fullname\]|<copyright holder>/i);
+  });
+
+  it('package.json 的 license 字段和 LICENSE 一致', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    expect(String(pkg.license).toUpperCase()).toContain('MIT');
+    // 开源项目的元信息不该留空
+    expect(pkg.name).toBeTruthy();
+    expect(pkg.description && pkg.description.length).toBeGreaterThan(5);
+    expect(pkg.repository || pkg.homepage || pkg.bugs, '至少要有 repository/homepage/bugs 之一').toBeTruthy();
+  });
+
+  it('README 里提到的每个 docs 文档都真的存在', () => {
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    const refs = [...readme.matchAll(/\(?(docs\/[A-Za-z0-9_.-]+\.md)\)?/g)].map((m) => m[1]);
+    const missing = [...new Set(refs)].filter((f) => !fs.existsSync(path.join(root, f)));
+    expect(missing, `README 提到了不存在的文档：${missing.join(', ')}`).toEqual([]);
+  });
+
+  it('仓库里没有把个人配置当成示例提交（handoff.config.json 必须被忽略）', () => {
+    const ignore = fs.readFileSync(path.join(root, '.gitignore'), 'utf8');
+    expect(ignore).toContain('handoff.config.json');
+    expect(ignore).toContain('.env');
+    expect(ignore).toContain('node_modules');
+  });
+
+  it('示例配置是合法 JSON，且默认什么都不开', () => {
+    const cfg = JSON.parse(fs.readFileSync(path.join(root, 'handoff.config.example.json'), 'utf8'));
+    // 默认必须是关的 —— 这是这个项目的安全立场，值得被测试守住
+    expect(cfg.tools?.webFetch?.enabled).toBe(false);
+    expect(cfg.tools?.webSearch?.enabled).toBe(false);
+    expect(cfg.tools?.readFile?.enabled).toBe(false);
+    expect(cfg.mcp?.enabled).toBe(false);
+  });
+
+  it('.env.example 里不留任何真实密钥的痕迹', () => {
+    const env = fs.readFileSync(path.join(root, '.env.example'), 'utf8');
+    // 允许出现 KEY= 但等号后面必须是空的或明显的占位
+    for (const line of env.split('\n')) {
+      const m = line.match(/^([A-Z_]*KEY[A-Z_]*)=(.*)$/);
+      if (m) {
+        expect(m[2].trim(), `${m[1]} 不该有默认值`).toBe('');
+      }
+    }
+  });
+});

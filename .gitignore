@@ -8,3 +8,9 @@ tmp/
 
 # vitest 的临时输出
 .vitest/
+
+# 个人能力配置（每个用户自己建；提交的只有 handoff.config.example.json）
+handoff.config.json
+
+# 技能目录里可能有私人内容时可按需忽略；默认保留，因为技能是项目资产
+# skills/

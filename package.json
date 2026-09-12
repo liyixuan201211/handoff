@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "交接 Handoff — 把普通人说不清楚的需求，变成 AI 团队真正交付的成果",
+  "description": "交接 Handoff —— 把普通人说不清楚的需求，变成 AI 团队真正交付的成果",
   "engines": {
     "node": ">=22.5.0"
   },
@@ -23,5 +23,24 @@
   "devDependencies": {
     "supertest": "^7.2.2",
     "vitest": "^5.0.0"
-  }
+  },
+  "license": "MIT",
+  "keywords": [
+    "ai",
+    "agent",
+    "mcp",
+    "llm",
+    "中文",
+    "普通人",
+    "automation",
+    "deepseek"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/handoff.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-org/handoff/issues"
+  },
+  "homepage": "https://github.com/your-org/handoff#readme"
 }

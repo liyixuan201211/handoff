@@ -1,0 +1,62 @@
+# CI：每次 push / PR 都跑一遍。
+#
+# 设计立场：**不调任何真实的模型 API**。
+# 理由有两条，都很实际：
+#   1. 开源项目不该要求贡献者提供 API Key 才能跑测试
+#   2. 依赖外部 API 的 CI 会因为对方的限流/抖动而随机变红 ——
+#      而"随机变红的 CI"会训练人忽略红色，比没有 CI 更糟
+# 真实调用的端到端测试用 HANDOFF_INTEGRATION=1 单独跑（本地，手动）。
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    name: 测试（Node ${{ matrix.node }} / ${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['22.x', '24.x']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 跑全部测试（不调真实模型）
+        run: npm test
+        env:
+          # 明确不设任何 API Key：测试套件必须在没有密钥的环境下全绿。
+          # 这本身就是一个断言 —— 如果哪条测试偷偷依赖了真实 Key，CI 会红。
+          HANDOFF_DATA_DIR: ${{ runner.temp }}/handoff-ci-data
+
+      - name: 端到端冒烟（离线演示模式）
+        run: node scripts/smoke.js
+
+      - name: 检查有没有 JSON 语法错误
+        run: |
+          for f in $(git ls-files '*.json'); do
+            node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" || { echo "❌ $f"; exit 1; }
+          done
+
+      - name: 检查有没有把密钥提交进来
+        run: |
+          # 真实的密钥形态（故意用不会匹配到测试里假 key 的模式）
+          if git grep -nE '(AIPING|DEEPSEEK|OPENAI|ANTHROPIC)_API_KEY=[^[:space:]]{10,}' -- . ':!*.example*' ':!.github/*'; then
+            echo "❌ 疑似真实密钥被提交"; exit 1
+          fi
+          if git grep -nE '"key"[[:space:]]*:[[:space:]]*"(QC|sk)-[A-Za-z0-9-]{16,}"' -- . ':!tests/*'; then
+            echo "❌ 疑似真实密钥被提交"; exit 1
+          fi
+          echo "✅ 没发现密钥"
