@@ -14,3 +14,12 @@ handoff.config.json
 
 # 技能目录里可能有私人内容时可按需忽略；默认保留，因为技能是项目资产
 # skills/
+
+# ---- Python 后端（src_py / tests_py）----
+__pycache__/
+*.py[cod]
+.venv/
+.venv*
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
