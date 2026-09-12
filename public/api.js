@@ -278,6 +278,17 @@ export function createApi(options) {
       }
     },
 
+    /**
+     * GET /api/jobs/:id/versions —— 交付物的历史版本 + 调用轨迹
+     *
+     * 为什么单独一个方法：版本正文可能很长（一份 4000 字 × 多版），
+     * 塞进详情响应会让每次刷新都传几十 KB。而用户绝大多数时候只看最新版。
+     */
+    async getVersions(id) {
+      const body = await request('/api/jobs/' + encodeURIComponent(id) + '/versions', { method: 'GET' });
+      return body && typeof body === 'object' ? body : { artifacts: [], toolTrace: [] };
+    },
+
     /** GET /api/health */
     health() {
       return request('/api/health', { method: 'GET' });

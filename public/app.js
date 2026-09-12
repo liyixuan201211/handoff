@@ -542,6 +542,7 @@ function renderHistory(main, state) {
 const DETAIL_TABS = [
   { key: 'artifact', label: '交付物' },
   { key: 'review', label: '验收' },
+  { key: 'trace', label: '团队做了什么' },
   { key: 'security', label: '安全检查' },
   { key: 'assume', label: '我们替你做的假设' },
 ];
@@ -1208,12 +1209,15 @@ class JobView {
     this.renderReview(job);
     this.renderSecurity(job);
     this.renderAssumptions(job);
+    this.renderTrace(job);
 
     const counts = {
       artifact: (job.artifacts || []).length,
       review: job.review ? 1 : 0,
       security: job.security ? 1 : 0,
       assume: job.plan && job.plan.assumptions ? job.plan.assumptions.length : 0,
+      // 轨迹面板的计数：技能 + 工具调用次数（0 时不显示徽章，避免噪音）
+      trace: (job.skillsUsed?.length ?? 0) + (Array.isArray(job.toolTrace) ? job.toolTrace.length : 0),
     };
     DETAIL_TABS.forEach((tab) => {
       const btnEl = this.tabButtons.get(tab.key);
@@ -1247,6 +1251,135 @@ class JobView {
     }
   }
 
+  /**
+   * 调用轨迹面板：把"团队用了什么"完整显示出来。
+   *
+   * 用户明确要求能看到 skill 和 MCP 的调用过程。这里做三件事：
+   *   1. 待办式列出每个技能（领域知识）—— "用上了「合同审查」"
+   *   2. 列出接上的 MCP 服务 —— "接上了 browser 服务，提供 12 个工具"
+   *   3. 列出每次都调用了什么工具、拿到什么、花了多久、成没成
+   *
+   * 为什么值得占一屏：用户请了一支 AI 团队替他办事，
+   * 他有权知道**这支团队动了什么东西** —— 尤其是"上了网""读了文件"这种对外的动作。
+   * 这也是这个产品"看得见"这个卖点的一部分。
+   */
+  renderTrace(job) {
+    const panel = this.tabPanels.get('trace');
+    if (!panel) return;
+    clear(panel);
+
+    const skills = job.skillsUsed ?? [];
+    const trace = Array.isArray(job.toolTrace) ? job.toolTrace : [];
+    const toolItems = trace.filter((t) => t.type === 'tool' || t.type === 'mcp_call');
+    const mcpItems = trace.filter((t) => t.type === 'mcp_connect');
+    const rounds = job.round ?? 1;
+
+    if (!skills.length && !trace.length) {
+      panel.appendChild(el('div', { class: 'soft-empty' }, [
+        el('p', {}, job.status === 'done'
+          ? '这次没有用到外部工具，团队是靠自己的知识完成的。'
+          : '团队还没开始动手，用到的工具会显示在这里。'),
+        el('p', { class: 'muted small' },
+          '想让团队能上网查、能读文件、能接外部工具？看 docs/TOOLS.md（默认全部关闭）。'),
+      ]));
+      return;
+    }
+
+    // 迭代轮次：重跑过才显示
+    if (rounds > 1) {
+      const roundBox = el('div', { class: 'trace-block' }, [
+        text('h3', 'trace-title', `一共迭代了 ${rounds} 轮`),
+        text('p', { class: 'muted small' },
+          '质检每指出问题，我们就从头重做一遍：重新查资料、重新写、重新审。'),
+      ]);
+      const list = el('ul', { class: 'trace-list' });
+      for (const h of job.roundHistory ?? []) {
+        const verdictText = {
+          pass: '通过', pass_with_notes: '通过（有几条建议）', needs_revision: '需要重做',
+        }[h.verdict] ?? h.verdict;
+        list.appendChild(el('li', { class: 'trace-item' }, [
+          text('span', 'trace-name', `第 ${h.round} 轮`),
+          text('span', 'trace-detail', `质检结论：${verdictText}${h.issues ? ` · ${h.issues} 条意见` : ''}`),
+        ]));
+      }
+      roundBox.appendChild(list);
+      panel.appendChild(roundBox);
+    }
+
+    if (skills.length) {
+      const box = el('div', { class: 'trace-block' }, [
+        text('h3', 'trace-title', '用上的经验（技能）'),
+        text('p', { class: 'muted small' },
+          '这些是别人写好、放在 skills/ 目录里的领域知识。团队按你的任务自动挑了相关的来参考。'),
+      ]);
+      const list = el('ul', { class: 'trace-list' });
+      for (const t of trace.filter((x) => x.type === 'skill')) {
+        list.appendChild(el('li', { class: 'trace-item' }, [
+          el('span', { class: 'trace-icon', 'aria-hidden': 'true' }, '📚'),
+          text('span', 'trace-name', t.name),
+          t.description ? text('span', 'trace-detail', t.description) : null,
+        ]));
+      }
+      if (!list.childNodes.length) {
+        for (const name of skills) {
+          list.appendChild(el('li', { class: 'trace-item' }, [
+            el('span', { class: 'trace-icon', 'aria-hidden': 'true' }, '📚'),
+            text('span', 'trace-name', name),
+          ]));
+        }
+      }
+      box.appendChild(list);
+      panel.appendChild(box);
+    }
+
+    if (mcpItems.length) {
+      const box = el('div', { class: 'trace-block' }, [
+        text('h3', 'trace-title', '接上的外部工具服务（MCP）'),
+      ]);
+      const list = el('ul', { class: 'trace-list' });
+      for (const t of mcpItems) {
+        list.appendChild(el('li', { class: 'trace-item' }, [
+          el('span', { class: 'trace-icon', 'aria-hidden': 'true' }, t.ok ? '🔌' : '⚠️'),
+          text('span', 'trace-name', t.server),
+          text('span', 'trace-detail',
+            t.ok ? `提供了 ${t.toolCount} 个工具` : `没接上：${t.error ?? '未知原因'}`),
+        ]));
+      }
+      box.appendChild(list);
+      panel.appendChild(box);
+    }
+
+    if (toolItems.length) {
+      const box = el('div', { class: 'trace-block' }, [
+        text('h3', 'trace-title', `用到的工具（${toolItems.length} 次）`),
+        text('p', { class: 'muted small' },
+          '每次调用都记在这里——包括它去看了哪个网页、读了你哪个文件。'),
+      ]);
+      const list = el('ul', { class: 'trace-list' });
+      for (const t of toolItems) {
+        const statusIcon = t.status === 'ok' ? '✅' : t.status === 'failed' ? '❌' : '⏳';
+        const argText = describeToolArgs(t.args);
+        const meta = [
+          t.ms != null ? `${(t.ms / 1000).toFixed(1)} 秒` : null,
+          t.stageKey ? `第 ${t.stageKey} 步` : null,
+          t.round > 1 ? `第 ${t.round} 轮` : null,
+        ].filter(Boolean).join(' · ');
+        list.appendChild(el('li', { class: 'trace-item' }, [
+          el('span', { class: 'trace-icon', 'aria-hidden': 'true' }, statusIcon),
+          el('span', { class: 'trace-name-wrap' }, [
+            text('span', 'trace-name', t.label || t.name),
+            argText ? text('span', 'trace-args', argText) : null,
+          ]),
+          t.summary ? text('span', 'trace-detail', t.summary) : null,
+          t.error ? text('span', 'trace-error', t.error) : null,
+          meta ? text('span', 'trace-meta mono', meta) : null,
+        ]));
+      }
+      box.appendChild(list);
+      panel.appendChild(box);
+    }
+  }
+
   renderArtifacts(job) {
     const panel = this.tabPanels.get('artifact');
     clear(panel);
@@ -1266,8 +1399,18 @@ class JobView {
       const hasBody = typeof body0 === 'string';
 
       const box = el('article', { class: 'artifact', 'data-artifact-id': String(art.id || '') });
+      const versionCount = Array.isArray(art.versions) ? art.versions.length : 0;
       const head = el('header', { class: 'artifact-head' }, [
-        text('h3', 'artifact-name', art.name || '未命名成果'),
+        el('span', { class: 'artifact-title-wrap' }, [
+          text('h3', 'artifact-name', art.name || '未命名成果'),
+          // 版本徽章：只在真的有多个版本时出现。
+          // 普通用户不需要知道"第 1 版"，那是噪音；但重跑过之后
+          // "这是第 2 版"是个重要信息（他可能想对比之前那版）。
+          versionCount > 1
+            ? el('span', { class: 'artifact-version-badge', title: `一共迭代了 ${versionCount} 版` },
+                `第 ${art.version ?? versionCount} 版`)
+            : null,
+        ]),
         el('span', { class: 'artifact-actions' }),
       ]);
       const actions = head.querySelector('.artifact-actions');
@@ -1296,6 +1439,68 @@ class JobView {
       actions.appendChild(copyBtn);
       actions.appendChild(dlBtn);
       actions.appendChild(openBtn);
+
+      // 「看历史版本」：默认**不显示历史**（普通人只需要最新那一版），
+      // 但想追溯的人（比如"上一版是怎么写的"）可以点开。
+      // 版本正文可能很长，所以按需从服务端取一次，不塞进详情响应。
+      if (versionCount > 1) {
+        const histBtn = btn(`看历史版本（${versionCount}）`, 'btn-sm btn-ghost');
+        const histBox = el('div', { class: 'artifact-history', hidden: true });
+        histBtn.addEventListener('click', async () => {
+          if (!histBox.hidden) {
+            histBox.hidden = true;
+            setText(histBtn, `看历史版本（${versionCount}）`);
+            return;
+          }
+          histBox.hidden = false;
+          setText(histBtn, '收起历史版本');
+          if (histBox.dataset.loaded === '1') return;
+          clear(histBox);
+          histBox.appendChild(el('p', { class: 'muted small' }, '正在取历史版本…'));
+          try {
+            const data = await api.getVersions(this.jobId);
+            const found = (data.artifacts || []).find((x) => x.artifactId === art.id);
+            clear(histBox);
+            if (!found || !found.versions?.length) {
+              histBox.appendChild(el('p', { class: 'muted small' }, '没有历史版本。'));
+              return;
+            }
+            found.versions.forEach((v) => {
+              const item = el('details', { class: 'version-item' });
+              item.appendChild(el('summary', {}, [
+                text('span', 'version-label', `第 ${v.n} 版`),
+                text('span', 'version-meta',
+                  `（第 ${v.round} 轮${v.stageKey ? ` · ${v.stageKey}` : ''} · ${v.chars} 字` +
+                  `${v.at ? ` · ${new Date(v.at).toLocaleTimeString('zh-CN', { hour12: false })}` : ''}）`),
+              ]));
+              // 历史版本同样要走 setRenderedMarkdown（内部逐段 escapeHtml）——
+              // 模型输出是不可信内容，历史版本也不例外。
+              const bodyEl = el('div', { class: 'version-body md' });
+              setRenderedMarkdown(bodyEl, v.content || '');
+              item.appendChild(bodyEl);
+              const bar = el('div', { class: 'version-actions' });
+              const useBtn = btn('用这一版', 'btn-sm btn-ghost');
+              useBtn.addEventListener('click', () => {
+                // "用这一版"= 把这份正文复制走。我们不自动覆盖当前版本 ——
+                // 那是"回到过去"，属于另一个功能；这里只帮他拿到文字。
+                copyPlainText(v.content || '').then((ok) =>
+                  toast(ok ? `第 ${v.n} 版已经复制好了` : '这个浏览器不让自动复制，请手动选中'),
+                );
+              });
+              bar.appendChild(useBtn);
+              item.appendChild(bar);
+              histBox.appendChild(item);
+            });
+            histBox.dataset.loaded = '1';
+          } catch (err) {
+            clear(histBox);
+            histBox.appendChild(el('p', { class: 'muted small' }, '历史版本暂时取不到，稍后再试。'));
+          }
+        });
+        actions.appendChild(histBtn);
+        // histBox 加在正文之后（下面 appendChild(box) 时会在末尾）
+        box.appendChild(histBox);
+      }
       if (art.confidence) {
         const conf = { high: '我们比较有把握', medium: '把握一般', low: '不太有把握，建议你核一下' }[art.confidence] || '';
         if (conf) actions.appendChild(el('span', { class: 'chip muted' }, conf));

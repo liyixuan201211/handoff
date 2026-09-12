@@ -37,6 +37,16 @@ import { SCHEMAS, systemPromptFor, buildUser, TEAM } from '../prompts/index.js';
 /** 运行中的任务：jobId → { controller, promise } */
 const running = new Map();
 
+/**
+ * 质检说不行时，最多重跑整条流水线几次。
+ *
+ * 为什么要有上限：每次重跑都要重新调模型（重新查资料、重新写），
+ * 是真的花钱和时间。而质检偶尔会"过于严格"（它会因为材料本身的限制而判不合格）。
+ * 1 次重跑能救回大部分"确实做得不好"的情况，再多就是拿用户的钱赌运气了。
+ * 可用 HANDOFF_MAX_ROUNDS 调整。
+ */
+const MAX_ROUNDS = Math.max(1, Number(process.env.HANDOFF_MAX_ROUNDS) || 2);
+
 /* ────────────────────────────────────────────────────────────────
  * 可选依赖。全部延迟加载，这样任何一个模块没就绪都不会让引擎起不来。
  * ──────────────────────────────────────────────────────────────── */
@@ -237,6 +247,17 @@ export function buildJobRecord(input) {
     status: 'queued',
     createdAt: now,
     updatedAt: now,
+    /**
+     * 第几轮。质检说不行时整条流水线会重跑，这个数字会 +1。
+     *
+     * ⚠️ 必须初始化为 1（不能留 undefined）。我之前只有"重跑时"才赋值，
+     * 于是第一轮 job.round 是 undefined —— 界面会显示"第 undefined 轮"，
+     * 而版本历史里 `round: job.round ?? 1` 又偷偷兜底成 1，两边不一致。
+     * 这类"默认值不一致"的 bug 不会报错，只会让数据看起来是对的、实际是错的。
+     */
+    round: 1,
+    roundHistory: [],
+    toolTrace: [],
     plan: null,
     stages: [],
     artifacts: [],
@@ -464,11 +485,34 @@ async function execute(job) {
 
     const finished = await deps.demo.runDemoPipeline(job.goal, (event) => emit(event), { signal });
 
+    // 演示模式的产物也要有"第 1 版"的版本记录 ——
+    // 否则两种模式的数据形状不一致，界面会一会儿有版本徽章一会儿没有，
+    // 而"演示模式"正是用户第一次看到这个产品时的样子。
+    const demoArtifacts = Array.isArray(finished.artifacts) ? finished.artifacts : [];
+    job.artifactHistory = job.artifactHistory ?? {};
+    for (const a of demoArtifacts) {
+      if (Array.isArray(a.versions) && a.versions.length) continue;
+      const content = typeof a.content === 'string' ? a.content : '';
+      const v = {
+        n: 1,
+        round: 1,
+        stageKey: 'draft',
+        content,
+        assumptions: a.assumptions ?? [],
+        confidence: a.confidence ?? 'medium',
+        at: Date.now(),
+        chars: content.replace(/\s/g, '').length,
+      };
+      a.version = 1;
+      a.versions = [v];
+      job.artifactHistory[String(a.deliverableId)] = [v];
+    }
+
     Object.assign(job, {
       status: finished.status ?? 'done',
       plan: finished.plan ?? job.plan,
       stages: finished.stages ?? job.stages,
-      artifacts: finished.artifacts ?? job.artifacts,
+      artifacts: demoArtifacts.length ? demoArtifacts : job.artifacts,
       review: finished.review ?? job.review,
       // 演示模式的安全结论优先（它是有意构造的示例）
       security: finished.security ?? job.security,
@@ -521,6 +565,109 @@ async function execute(job) {
    * 语法检查通不过它，单测也可能碰不到，只有真的跑一遍才暴露。
    */
   let skillsBlock = '';
+
+
+  /**
+   * 调用轨迹：把"团队用了什么"完整记下来给用户看。
+   *
+   * 记三类东西（按时间顺序）：
+   *   skill       —— 加载了哪个技能（领域知识）
+   *   mcp_connect —— 连上了哪个 MCP 服务、它提供了几个工具
+   *   mcp_call    —— 调用了哪个 MCP 工具、拿到什么
+   *   tool        —— 调用了哪个原生工具
+   *
+   * 为什么值得单独记一份（而不是只靠 SSE 事件流）：
+   * 事件流是**内存里的、会过期的**（每个 job 最多留 500 条，重启就没了）。
+   * 而"我请的团队到底动了什么"是用户想事后回看的东西 ——
+   * 他可能第二天才想起来查"这个结论是从哪来的"。
+   */
+  job.toolTrace = job.toolTrace ?? [];
+
+  /** 记一条轨迹（同时落盘 + 广播，两边都不落空） */
+  const recordTrace = (entry) => {
+    const item = { at: Date.now(), round: job.round ?? 1, ...entry };
+    job.toolTrace.push(item);
+    job.updatedAt = Date.now();
+    return item;
+  };
+
+  try {
+    const cfg = toolConfigRef.value;
+    if (cfg?.skills) {
+      const prepared = prepareSkillsForGoal({
+        goal: job.goal,
+        config: cfg.skills,
+        rootDir: cfg.__rootDir ?? process.cwd(),
+      });
+      skillsBlock = prepared.block;
+
+      if (prepared.used.length) {
+        // 每个技能单独记一条，界面上能逐个显示"用上了「合同审查」"
+        for (const sk of prepared.used) {
+          recordTrace({
+            type: 'skill',
+            name: sk.name,
+            description: sk.description ?? '',
+            chars: (sk.body ?? '').length,
+          });
+          emit({
+            type: 'trace',
+            kind: 'skill',
+            name: sk.name,
+            description: sk.description ?? '',
+            at: Date.now(),
+          });
+        }
+        job.skillsUsed = prepared.used.map((x) => x.name);
+        emit({
+          type: 'log',
+          stageId: null,
+          level: 'info',
+          text: `找到了相关的经验，会用上：${prepared.used.map((x) => x.name).join('、')}`,
+          at: Date.now(),
+        });
+        emit({ type: 'skills', names: prepared.used.map((x) => x.name) });
+      }
+      if (prepared.warnings?.length) {
+        for (const w of prepared.warnings) {
+          emit({ type: 'log', stageId: null, level: 'warn', text: `经验库：${w}`, at: Date.now() });
+        }
+      }
+    }
+  } catch (err) {
+    // 技能加载失败只是"少一点帮助"，绝不能让任务起不来
+    emit({
+      type: 'log',
+      stageId: null,
+      level: 'warn',
+      text: `经验库没读上（不影响这次任务）：${redactSecrets(String(err?.message ?? err)).slice(0, 120)}`,
+      at: Date.now(),
+    });
+  }
+
+  // MCP 服务的连接情况也记进轨迹（用户需要知道"接了什么外部工具"）
+  try {
+    const { mcpState } = await import('../tools/mcp-client.js');
+    for (const srv of mcpState?.servers ?? []) {
+      recordTrace({
+        type: 'mcp_connect',
+        server: srv.name,
+        ok: srv.ok,
+        toolCount: srv.toolCount ?? 0,
+        error: srv.error ?? null,
+      });
+      emit({
+        type: 'trace',
+        kind: 'mcp_connect',
+        server: srv.name,
+        ok: srv.ok,
+        toolCount: srv.toolCount ?? 0,
+        at: Date.now(),
+      });
+    }
+  } catch {
+    /* MCP 没开或加载失败：轨迹里就没有它，不影响任务 */
+  }
 
   /** 当前正在跑的阶段（永远取最后一个，避免索引错位） */
   const currentStage = () => job.stages.at(-1) ?? null;
@@ -575,6 +722,15 @@ async function execute(job) {
   const callModelWithToolsWithAccounting = async (opts) => {
     checkAbort();
     const started = Date.now();
+    // ⚠️ 优先用调用方显式传进来的 stage。
+    //
+    // 为什么不能靠 currentStage()（取 job.stages 的最后一个）：
+    // 重跑时我们**重建了整个阶段列表**，而 take 顺序是 intake → plan → 其余。
+    // 在 research 阶段执行时，job.stages 的最后一项可能是 deliver（上一轮留下的），
+    // 于是工具调用被错误地标成"第 deliver 步" —— 用户在"团队做了什么"里
+    // 会看到"读文件发生在交付阶段"，完全对不上。
+    // 实测就是这么发现的：stageKey 报的是 deliver 而不是 research。
+    const stageHint = opts.stage ?? null;
     const res = await callModelWithTools({
       ...opts,
       signal,
@@ -586,7 +742,7 @@ async function execute(job) {
       //   工具路径直接断掉。少一层间接就少一类这类 bug。）
       onNotice: (n) => {
         notices.push(n);
-        const st = currentStage();
+        const st = stageHint ?? currentStage();
         if (st) st.log.push({ at: Date.now(), level: n.level ?? 'warn', text: n.text });
         emit({
           type: 'log',
@@ -597,7 +753,7 @@ async function execute(job) {
         });
       },
       onToolCall: (e) => {
-        const st = currentStage();
+        const st = stageHint ?? currentStage();
         job.toolCalls = job.toolCalls ?? [];
         if (e.phase === 'start') {
           // ⚠️ 必须用 currentStage()，不能写 `stage`。
@@ -610,6 +766,16 @@ async function execute(job) {
           // 表现是"功能好像没生效"，但没有任何报错。
           // 教训：catch 里什么都不做，等于把 bug 藏起来。见下面的 catch。
           job.toolCalls.push({ name: e.name, args: e.args, at: Date.now(), stageKey: st?.key ?? null });
+          // 也记进"调用轨迹"（原生工具和 MCP 工具都会走到这里）
+          const traceItem = recordTrace({
+            type: e.name.includes('__') ? 'mcp_call' : 'tool',
+            name: e.name,
+            label: friendlyToolName(e.name),
+            args: e.args,
+            stageKey: st?.key ?? null,
+            status: 'running',
+          });
+          job.__lastTrace = traceItem;
           const text = `要用「${friendlyToolName(e.name)}」${describeToolArgs(e.args)}`;
           if (st) st.log.push({ at: Date.now(), level: 'info', text });
           emit({
@@ -628,6 +794,16 @@ async function execute(job) {
             last.ms = e.ms;
             last.status = e.status;
             last.summary = e.summary;
+          }
+          // 轨迹里那条也补上结果（按名字找最近一条还没结束的）
+          const traceItem = [...(job.toolTrace ?? [])]
+            .reverse()
+            .find((x) => x.name === e.name && x.status === 'running');
+          if (traceItem) {
+            traceItem.ms = e.ms;
+            traceItem.status = e.status;
+            traceItem.summary = e.summary;
+            traceItem.error = e.error ?? null;
           }
           const text =
             e.status === 'ok'
@@ -772,6 +948,67 @@ async function execute(job) {
 
   /* 阶段 3..n：按 planner 编排的剩余阶段依次执行 */
   const remaining = normalized.keys.filter((k) => k !== 'intake' && k !== 'plan');
+
+  /**
+   * 整条流水线重跑的外层循环。
+   *
+   * ⚠️ 这是"质检说不行就从头再来"的实现方式：
+   * 内层 `roundLoop` 跑完一轮（调研→动手做→挑毛病→改稿→验收），
+   * 如果质检给出 `needs_revision`，我们就**从 intake 之后重新走一遍** ——
+   * 重新查资料、重新写、重新审。
+   *
+   * 为什么用带标签的 continue 而不是把循环体抽成函数：
+   * 循环体里引用了十几个闭包变量（artifacts / outputs / job / emit…），
+   * 抽成函数要传一大堆参数，反而更容易出错。带标签的 continue 改动最小、
+   * 语义最直白：**"回到本轮开头再跑一遍"**。
+   *
+   * ── 刻意不重跑的两个阶段：intake 和 plan ──────────────────────
+   *
+   * 它们在 `roundLoop` **之前**执行，所以重跑时不会重做。理由：
+   *   · 用户的需求没变（他看的是同一句话）
+   *   · 交付物清单没变（还是那几份东西）
+   *   · 这两步每次都要调模型，重做一遍是纯粹的钱和时间浪费
+   * 质检提出的意见针对的是**内容质量**（空话、编造、写得断断续续），
+   * 而这些是 research / draft / critique / revise 该解决的问题。
+   *
+   * **真正会重跑的是**：调研 → 动手做 → 挑毛病 → 改稿 → 验收 → 交付。
+   * 也就是说"重新查资料、重新写"这两件用户明确要求的事，确实都重做了。
+   */
+  roundLoop: for (let round = 1; round <= MAX_ROUNDS; round += 1) {
+  if (round > 1) {
+    // 新一轮：清掉上一轮的产物与结论，从干净状态开始。
+    // 不清的话，新一轮的 draft 会"复用"旧内容，等于没有重做。
+    // ⚠️ 只清"本轮产物"，**不清 artifactHistory** ——
+    // 历史是用户要追溯的东西，清了就再也找不回上一版长什么样了。
+    artifacts = [];
+    job.artifacts = [];
+    job.review = null;
+    job.clarifyQuestions = [];
+    for (const k of Object.keys(outputs)) delete outputs[k];
+    // 阶段状态重置（intake / plan 的产出仍然有效，阶段本身重跑一遍很便宜，
+    // 但"重新理解需求"正是用户要的 —— 让整条链都真重跑）
+    for (const st of job.stages) {
+      st.status = 'pending';
+      st.startedAt = null;
+      st.endedAt = null;
+      st.ms = null;
+      st.error = null;
+      st.log = [];
+    }
+    job.round = round;
+    job.updatedAt = Date.now();
+    await save(job);
+    emit({
+      type: 'log',
+      stageId: null,
+      level: 'warn',
+      text: `质检说这次做得还不够好。我们从头再来一遍（第 ${round} 轮）：重新查资料、重新写、重新审。`,
+      at: Date.now(),
+    });
+    emit({ type: 'round', round, maxRounds: MAX_ROUNDS });
+    emit({ type: 'job', job: summarize(job) });
+  }
+
   for (const key of remaining) {
     checkAbort();
     const stage =
@@ -892,6 +1129,46 @@ async function execute(job) {
     }
     // deliver 之后就没有阶段了；中途也要更新摘要让前端进度条走动
     emit({ type: 'job', job: summarize(job) });
+  }
+
+    /* ── 一轮结束：质检说不行就整条重跑 ────────────────────────── */
+    const verdict = job.review?.verdict;
+    if (verdict === 'needs_revision' && round < MAX_ROUNDS) {
+      emit({
+        type: 'log',
+        stageId: null,
+        level: 'warn',
+        text: `质检判定「需要重做」。准备从头再跑一轮（还有 ${MAX_ROUNDS - round} 次机会）。`,
+        at: Date.now(),
+      });
+      // 记录这一轮的结论，供界面展示"第几轮是什么结论"
+      job.roundHistory = job.roundHistory ?? [];
+      job.roundHistory.push({
+        round,
+        verdict,
+        issues: (job.review?.issues ?? []).length,
+        at: Date.now(),
+      });
+      continue roundLoop; // ← 回到本轮开头，整条重跑
+    }
+    if (verdict === 'needs_revision') {
+      // 重跑机会用完了，但仍要交付（有东西比没东西好），界面会标注质检意见
+      emit({
+        type: 'log',
+        stageId: null,
+        level: 'warn',
+        text: `质检仍然认为需要改进，但重跑次数已用尽。我们把现有成果交给你，并如实标注质检意见。`,
+        at: Date.now(),
+      });
+    }
+    job.roundHistory = job.roundHistory ?? [];
+    job.roundHistory.push({
+      round,
+      verdict: verdict ?? 'unknown',
+      issues: (job.review?.issues ?? []).length,
+      at: Date.now(),
+    });
+    break roundLoop;
   }
 
   /* 收尾：安全审计 + 最终状态判定 */
@@ -1026,7 +1303,8 @@ async function runOneStage({
       artifacts,
       callModel,
       // 带工具的调用入口 + 本阶段允许用哪些工具
-      callModelWithTools,
+      // 显式把"当前是哪个阶段"传下去：工具与降级日志都要标对阶段
+      callModelWithTools: (opts) => callModelWithTools({ stage, ...opts }),
       toolsAvailable: toolsForStage(key),
       skillsBlock,
       log,
@@ -1167,12 +1445,64 @@ export function buildArtifacts(job, rawArtifacts, previous = []) {
     const content = typeof raw?.content === 'string' ? raw.content : '';
     const prev = previous.find((p) => p.deliverableId === deliverableId);
 
+    // ── 版本历史 ────────────────────────────────────────────────
+    //
+    // 每重跑一轮就产出一个新版本。**旧版本不删**，因为：
+    //   · 用户可能想对比"上一版和这一版差在哪"
+    //   · 质检意见是针对某一版的，删掉版本就看不懂意见了
+    //   · 重跑是花过钱的，把它扔掉等于浪费用户的额度
+    // 但界面上**默认只显示最新版** —— 普通人不需要看到五个版本，
+    // 他需要的是"最后那一版"。想追溯的人才去点开历史。
+    //
+    // ⚠️ 顺序要求：priorVersions 必须在 versionNo 之前算出来。
+    // （我第一版把 versionNo 写在前面，直接 "Cannot access 'priorVersions'
+    //   before initialization" —— TDZ 错误，整条流水线在 draft 阶段就挂。）
+    // ⚠️ 版本历史必须存在 **job.artifactHistory** 上，不能只存在 artifact.versions 里。
+    //
+    // 为什么：重跑时我们会清空 `job.artifacts`（新一轮要从干净状态开始），
+    // 如果历史只跟着 artifact 走，第一轮的版本就被一起扔掉了 ——
+    // 而"用户能查询每个版本"正是这个功能存在的理由。
+    // artifactHistory 是**跨轮持久**的，deliverableId 是它的键。
+    job.artifactHistory = job.artifactHistory ?? {};
+    const key = String(deliverableId);
+    let priorVersions = Array.isArray(job.artifactHistory[key]) ? [...job.artifactHistory[key]] : [];
+
+    // 同一轮里 draft 和 revise 都会写这个交付物。
+    // 它们属于**同一轮的两个阶段**，不是两个版本 —— 否则一轮就产生 2 个"版本"，
+    // 用户看到的"版本历史"会全是同一轮的中间稿，噪音大于价值。
+    if (priorVersions.length && priorVersions.at(-1).round === (job.round ?? 1)) {
+      priorVersions = priorVersions.slice(0, -1);
+    }
+
+    const artifactId = prev?.id ?? newId('art');
+    const stageKey = (job.stages ?? []).filter((s) => s.status === 'done').at(-1)?.key ?? purpose ?? 'draft';
+    const versionNo = (priorVersions.at(-1)?.n ?? 0) + 1;
+
+    const thisVersion = {
+      n: versionNo,
+      round: job.round ?? 1,
+      stageKey,
+      content,
+      assumptions: raw?.assumptions ?? prev?.assumptions ?? [],
+      confidence: normalizeConfidence(raw?.confidence ?? prev?.confidence),
+      at: Date.now(),
+      chars: content.replace(/\s/g, '').length,
+    };
+
+    const allVersions = [...priorVersions, thisVersion];
+    // 跨轮持久化：history 是"这个交付物历次长什么样"的权威记录
+    job.artifactHistory[key] = allVersions;
+
     produced.push({
-      id: prev?.id ?? newId('art'),
+      id: artifactId,
       deliverableId,
       name: deliverable?.name ?? raw?.name ?? `交付物 ${i + 1}`,
       format: 'markdown',
+      // content 永远是**最新版**（用户默认只看这个，也是下载/复制的来源）
       content,
+      // version 便于界面标注"第 2 版"
+      version: versionNo,
+      versions: allVersions,
       assumptions: raw?.assumptions ?? prev?.assumptions ?? [],
       // ⚠️ confidence 必须在这里归一化（缺陷 #11）。
       // draft/revise 走的是"定界符长文本协议"（schema:null），**结构校验没人做**；
@@ -1248,12 +1578,34 @@ function buildDeliverArtifact(job, deliverOut) {
     lines.push('');
     for (const c of deliverOut.cautions) lines.push(`> ⚠️ ${c}`);
   }
+  const guideContent = lines.join('\n');
+  job.artifactHistory = job.artifactHistory ?? {};
+  const guideKey = '__handoff_guide__';
+  let guideVersions = Array.isArray(job.artifactHistory[guideKey]) ? [...job.artifactHistory[guideKey]] : [];
+  if (guideVersions.length && guideVersions.at(-1).round === (job.round ?? 1)) {
+    guideVersions = guideVersions.slice(0, -1);
+  }
+  const guideVersion = {
+    n: (guideVersions.at(-1)?.n ?? 0) + 1,
+    round: job.round ?? 1,
+    stageKey: 'deliver',
+    content: guideContent,
+    assumptions: plan.assumptions ?? [],
+    confidence: 'high',
+    at: Date.now(),
+    chars: guideContent.replace(/\s/g, '').length,
+  };
+  guideVersions = [...guideVersions, guideVersion];
+  job.artifactHistory[guideKey] = guideVersions;
+
   return {
     id: newId('art'),
-    deliverableId: '__handoff_guide__',
+    deliverableId: guideKey,
     name: '先看这份：怎么用',
     format: 'markdown',
-    content: lines.join('\n'),
+    content: guideContent,
+    version: guideVersion.n,
+    versions: guideVersions,
     assumptions: plan.assumptions ?? [],
     confidence: 'high',
     basedOn: (job.stages ?? []).filter((s) => s.status === 'done').map((s) => s.id),

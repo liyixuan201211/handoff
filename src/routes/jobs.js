@@ -312,6 +312,48 @@ export function createJobsRouter() {
     }
   });
 
+  /**
+   * GET /api/jobs/:id/versions —— 交付物的历史版本（迭代追溯）
+   *
+   * 为什么单独一个端点：版本正文可能很长（一份 4000 字 × 5 版 = 2 万字），
+   * 塞进详情响应里会让每次刷新都传几十 KB。而用户**绝大多数时候只看最新版**
+   * （详情接口的 content 就是最新版）。只有想追溯"上一版长什么样"的人才来这里。
+   *
+   * 返回**元信息 + 正文**：想看正文的人不用再发一次请求。
+   * 如果将来版本多到很大，再加 ?meta=1 只取元信息。
+   */
+  router.get('/jobs/:id/versions', async (req, res, next) => {
+    try {
+      const job = await loadJobOr404(req.params.id, res);
+      if (!job) return;
+      const artifacts = (job.artifacts ?? []).map((a) => ({
+        artifactId: a.id,
+        deliverableId: a.deliverableId ?? null,
+        name: a.name,
+        currentVersion: a.version ?? 1,
+        // 版本列表：最新在前（用户最可能想看最近两版的区别）
+        versions: [...(a.versions ?? [])].reverse().map((v) => ({
+          n: v.n,
+          round: v.round ?? 1,
+          stageKey: v.stageKey ?? null,
+          at: v.at ?? null,
+          chars: v.chars ?? (typeof v.content === 'string' ? v.content.replace(/\s/g, '').length : 0),
+          confidence: v.confidence ?? null,
+          content: v.content ?? '',
+        })),
+      }));
+      res.json({
+        rounds: job.round ?? 1,
+        roundHistory: job.roundHistory ?? [],
+        toolTrace: job.toolTrace ?? [],
+        skillsUsed: job.skillsUsed ?? [],
+        artifacts,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // GET /api/jobs/:id
   router.get('/jobs/:id', async (req, res, next) => {
     try {

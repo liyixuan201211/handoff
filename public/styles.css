@@ -164,6 +164,60 @@ button { font: inherit; color: inherit; }
 }
 .log-line-tool .log-text { font-weight: 500; }
 
+/* ── 版本历史 ─────────────────────────────────────────────
+   默认只显示最新版；想看迭代过程的人才点开。
+   普通人不需要看到五个版本，他需要的是"最后那一版"。 */
+.artifact-title-wrap { display: flex; align-items: baseline; gap: var(--sp-2); flex-wrap: wrap; }
+.artifact-version-badge {
+  font-size: .78rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft, var(--line-soft));
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.artifact-history {
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px dashed var(--line);
+  display: grid;
+  gap: var(--sp-2);
+}
+.version-item {
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface-2, transparent);
+}
+.version-item > summary { cursor: pointer; display: flex; gap: var(--sp-2); flex-wrap: wrap; align-items: baseline; }
+.version-label { font-weight: 600; }
+.version-meta { color: var(--text-2); font-size: .85rem; }
+.version-body { margin-top: var(--sp-3); max-height: 420px; overflow: auto; }
+.version-actions { margin-top: var(--sp-2); }
+
+/* ── 调用轨迹面板 ─────────────────────────────────────────
+   用户要求能看到 skill 和 MCP 的调用过程。 */
+.trace-block { margin-bottom: var(--sp-5); }
+.trace-block:last-child { margin-bottom: 0; }
+.trace-title { font-size: 1rem; margin: 0 0 var(--sp-1); }
+.trace-list { list-style: none; margin: var(--sp-2) 0 0; padding: 0; display: grid; gap: var(--sp-2); }
+.trace-item {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sp-1) var(--sp-2);
+  align-items: baseline;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+.trace-icon { grid-row: span 4; font-size: 1rem; }
+.trace-name-wrap { display: flex; gap: var(--sp-2); flex-wrap: wrap; align-items: baseline; }
+.trace-name { font-weight: 600; }
+.trace-args { color: var(--text-2); font-size: .85rem; word-break: break-all; }
+.trace-detail { color: var(--text-2); font-size: .88rem; }
+.trace-error { color: var(--warn); font-size: .88rem; }
+.trace-meta { color: var(--text-3, var(--text-2)); font-size: .8rem; opacity: .8; }
+
 /* 演示模式提示条：明说"这是样例，跟你的问题无关"。
    不写清楚的话，用户会以为产品答非所问 —— 那比不做演示还糟。 */
 .demo-note {
