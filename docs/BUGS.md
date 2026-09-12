@@ -38,7 +38,7 @@
 **复现**（当时的原始探测脚本，03:09 运行）：
 
 ```bash
-cd /Users/imac/260912/handoff && node .probe/probe2.mjs
+cd handoff && node .probe/probe2.mjs
 ```
 
 ```js

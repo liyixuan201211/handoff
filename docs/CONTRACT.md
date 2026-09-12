@@ -68,7 +68,7 @@
 ## 1. 仓库结构（冻结）
 
 ```
-/Users/imac/260912/handoff
+handoff
 ├── package.json
 ├── .env.example
 ├── README.md

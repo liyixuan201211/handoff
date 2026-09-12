@@ -9,7 +9,7 @@
 ## 30 秒上手
 
 ```bash
-cd /Users/imac/260912/handoff
+cd handoff
 npm install
 npm start
 ```

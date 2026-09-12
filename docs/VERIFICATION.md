@@ -17,7 +17,7 @@
 ## 0. 环境前置检查
 
 ```bash
-cd /Users/imac/260912/handoff
+cd handoff
 node -v     # README 要求 >= 22.5.0；实测环境为 v24.19.0 ✅
 npm -v      # 实测 11.17.0
 ```
@@ -34,7 +34,7 @@ npm -v      # 实测 11.17.0
 ```bash
 # 在干净目录里装，避免复用已有 node_modules
 rm -rf /tmp/hf-verify && mkdir -p /tmp/hf-verify
-cd /Users/imac/260912/handoff
+cd handoff
 cp package.json package-lock.json /tmp/hf-verify/
 cd /tmp/hf-verify && npm install
 ```
@@ -52,7 +52,7 @@ npm ls --depth=0     # 直接依赖确实只有 3 个
 ### 1.2 `npm start` 真的跑在 8787 吗？
 
 ```bash
-cd /Users/imac/260912/handoff
+cd handoff
 node src/server.js > /tmp/hf-srv.log 2>&1 &
 sleep 4
 cat /tmp/hf-srv.log
@@ -84,7 +84,7 @@ grep -o "交接 Handoff[^<]*" /tmp/hf-index.html | head -3
 
 ```bash
 mkdir -p /tmp/hf-fakehome
-cd /Users/imac/260912/handoff
+cd handoff
 HOME=/tmp/hf-fakehome HANDOFF_DEMO=1 HANDOFF_PORT=18801 HANDOFF_DATA_DIR=/tmp/hf-demo/data \
   node src/server.js > /tmp/hf-demo.log 2>&1 &
 sleep 4
@@ -155,7 +155,7 @@ sed -n '37,43p' src/llm/providers.js
 ### 1.7 README 里的测试脚本真的存在吗？跑得通吗？
 
 ```bash
-cd /Users/imac/260912/handoff
+cd handoff
 npm test          ; echo "EXIT=$?"
 npm run test:unit ; echo "EXIT=$?"
 npm run test:e2e  ; echo "EXIT=$?"
@@ -217,15 +217,15 @@ ls docs/PLAYBOOK.md
 
 ```bash
 # 1) 静态：全仓搜 dotenv / loadEnvFile / .env 读取
-cd /Users/imac/260912/handoff
+cd handoff
 grep -rn "dotenv\|loadEnvFile\|\.env" src/ scripts/
 # → 只匹配到注释和错误提示文字，没有任何读取 .env 的代码
 
 # 2) 动态：真的建一个 .env，看它生不生效
 rm -rf /tmp/hf-envtest && mkdir -p /tmp/hf-envtest
-cd /Users/imac/260912/handoff
+cd handoff
 cp -R src public templates package.json /tmp/hf-envtest/
-ln -s /Users/imac/260912/handoff/node_modules /tmp/hf-envtest/node_modules
+ln -s handoff/node_modules /tmp/hf-envtest/node_modules
 printf 'HANDOFF_PORT=9911\nHANDOFF_DATA_DIR=./data\n' > /tmp/hf-envtest/.env
 
 cd /tmp/hf-envtest && HANDOFF_DEMO=1 node src/server.js &
@@ -314,7 +314,7 @@ grep -n "apiKeyEnv" -A 2 src/llm/providers.js
 用一枚**独一无二的可搜索字符串**当 Key，跑完整流程后全局搜。
 
 ```bash
-cd /Users/imac/260912/handoff
+cd handoff
 FAKEKEY="sk-s14CANARY1234567890abcdefCANARY"
 HOME=/tmp/hf-fakehome AIPING_API_KEY="$FAKEKEY" DEEPSEEK_API_KEY="$FAKEKEY" \
   HANDOFF_DEMO=1 HANDOFF_PORT=18803 HANDOFF_DATA_DIR=/tmp/hf-key/data \
@@ -590,7 +590,7 @@ npx vitest run tests/unit/security.test.js
 ### 6.1 `node scripts/dry-run.js`（真打模型，**会花钱**）
 
 ```bash
-cd /Users/imac/260912/handoff
+cd handoff
 node scripts/dry-run.js          # 只跑一次！
 ```
 
@@ -636,7 +636,7 @@ HANDOFF_INTEGRATION=1 npx vitest run tests/e2e/pipeline.test.js
 ## 7. 一条命令检查本清单是否仍然成立
 
 ```bash
-cd /Users/imac/260912/handoff
+cd handoff
 
 # 1) 稳定层：这两个 + 冒烟必须退出码 0
 npm run test:unit && npm run test:e2e && node scripts/smoke.js && echo "稳定层通过 ✅"

@@ -13,7 +13,7 @@
  */
 
 /** 一个形态真实的假密钥。用于断言「密钥绝不泄漏」——刻意用真 key 的样子。 */
-export const TEST_KEY = 'sk-live-9f3aQ7xK2mZ8pR4tV6yB1nC5dE0gH2jL';
+export const TEST_KEY = 'sk-test-not-a-real-key-000000000000';
 
 /** OpenAI 兼容的成功响应体 */
 export function completionBody(content, { promptTokens = 10, completionTokens = 20, finishReason = 'stop' } = {}) {

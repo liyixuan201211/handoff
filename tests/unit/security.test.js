@@ -307,7 +307,7 @@ describe('C. 密钥检测与打码（detail 里绝不出现原文）', () => {
  * D. PII
  * ================================================================== */
 describe('D. 隐私信息（只报数量，不写原文）', () => {
-  const phone = '13812345678';
+  const phone = '13800000000';
   const idcard = '110105199003074219';
   const bank = '6222021234567890123';
 
@@ -338,7 +338,7 @@ describe('D. 隐私信息（只报数量，不写原文）', () => {
 
   it('D4 混合 PII：汇总成一条，三类都点到', () => {
     // 注意：这里用各自的合法形态，且 62 开头的卡号故意避开手机号前缀
-    const r = auditOutput(`手机 13812345678 身份证 110105199003074219 卡 6212345678901234\n` + '正文'.repeat(50));
+    const r = auditOutput(`手机 13800000000 身份证 110105199003074219 卡 6212345678901234\n` + '正文'.repeat(50));
     const f = r.findings.filter((x) => x.kind === 'pii');
     expect(f).toHaveLength(1);
     expect(f[0].detail).toMatch(/发现 3 处/);
@@ -575,12 +575,12 @@ describe('H. auditJob 整体判定', () => {
 
   it('H2 产物里有 PII → notice，且定位到具体 artifact', () => {
     const r = auditJob({
-      artifacts: [{ id: 'art_2', name: '通讯录', content: `${longText('联系方式如下。')}\n手机 13812345678` }],
+      artifacts: [{ id: 'art_2', name: '通讯录', content: `${longText('联系方式如下。')}\n手机 13800000000` }],
     });
     expect(r.level).toBe('notice');
     const f = r.findings.find((x) => x.kind === 'pii');
     expect(f.where).toContain('art_2');
-    expect(flatten(r.findings)).not.toContain('13812345678');
+    expect(flatten(r.findings)).not.toContain('13800000000');
   });
 
   it('H3 输入阶段的注入 finding 会被带进 job.security，level=notice', () => {
@@ -615,7 +615,7 @@ describe('H. auditJob 整体判定', () => {
   it('H6 多个产物里相同问题会去重（不会刷屏）', () => {
     const r = auditJob({
       artifacts: [
-        { id: 'a1', content: longText('正文。') + ' 13812345678' },
+        { id: 'a1', content: longText('正文。') + ' 13800000000' },
         { id: 'a2', content: longText('正文。') + ' 13900002222' },
       ],
     });
@@ -631,10 +631,10 @@ describe('H. auditJob 整体判定', () => {
   });
 
   it('H8 describeSecurity 给普通人一句话，不出现术语和原文', () => {
-    const sec = auditJob({ artifacts: [{ id: 'a1', content: longText('这是一段完整的正文段落。') + ' 13812345678' }] });
+    const sec = auditJob({ artifacts: [{ id: 'a1', content: longText('这是一段完整的正文段落。') + ' 13800000000' }] });
     const line = describeSecurity(sec);
     expect(line).toMatch(/安全检查/);
-    expect(line).not.toContain('13812345678');
+    expect(line).not.toContain('13800000000');
     expect(line).not.toContain('PII');
     expect(describeSecurity({ level: 'clean', findings: [] })).toMatch(/通过/);
     expect(describeSecurity(null)).toMatch(/通过/);
