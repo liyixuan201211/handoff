@@ -218,6 +218,69 @@ button { font: inherit; color: inherit; }
 .trace-error { color: var(--warn); font-size: .88rem; }
 .trace-meta { color: var(--text-3, var(--text-2)); font-size: .8rem; opacity: .8; }
 
+/* ── Markdown 表格 ──────────────────────────────────────
+   AI 写"方案对比""条款逐条"时一定用表格，而这是普通用户最需要看清的东西。
+   外层 wrap 负责横向滚动：手机上列多了不能把整页撑破。 */
+.md-table-wrap {
+  margin: var(--sp-3) 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+.md-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .92rem;
+  min-width: 320px;
+}
+.md-table th,
+.md-table td {
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--line-soft, var(--line));
+  text-align: left;
+  vertical-align: top;
+  line-height: 1.6;
+}
+.md-table th {
+  background: var(--surface-2, var(--line-soft));
+  font-weight: 600;
+  white-space: nowrap;
+}
+.md-table tbody tr:last-child td { border-bottom: none; }
+.md-table tbody tr:nth-child(even) { background: color-mix(in srgb, var(--line-soft) 40%, transparent); }
+
+/* 任务清单：AI 写"待办"时用 - [ ]，用户要拿它一项项打勾 */
+.md-ul { list-style: none; padding-left: 0; }
+.md-task { display: flex; gap: var(--sp-2); align-items: flex-start; }
+.md-checkbox { flex: 0 0 auto; font-size: 1.05em; line-height: 1.5; }
+.md-task.is-done { color: var(--text-2); }
+.md-task.is-done .md-checkbox { color: var(--ok, var(--accent)); }
+
+/* ── 数学公式 ────────────────────────────────────────────
+   不引 KaTeX（几百 KB + 字体 + 要 CDN/打包），
+   但 AI 算账时一定会输出 LaTeX，所以做保守转换。 */
+.tex-inline {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: .95em;
+  padding: 0 2px;
+  color: var(--text-1, inherit);
+}
+.tex-block {
+  margin: var(--sp-3) 0;
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--surface-2, var(--line-soft));
+  border-left: 3px solid var(--accent, var(--line));
+  border-radius: var(--r-sm);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  overflow-x: auto;
+  line-height: 1.9;
+}
+.tex-block sup, .tex-inline sup { font-size: .75em; vertical-align: super; line-height: 0; }
+.tex-block sub, .tex-inline sub { font-size: .75em; vertical-align: sub; line-height: 0; }
+.tex-sep { padding: 0 1px; opacity: .75; }
+.tex-frac { white-space: nowrap; }
+
 /* 演示模式提示条：明说"这是样例，跟你的问题无关"。
    不写清楚的话，用户会以为产品答非所问 —— 那比不做演示还糟。 */
 .demo-note {

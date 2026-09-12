@@ -12,6 +12,7 @@ import {
   formatElapsed, formatRelative, summarize,
   statusLabel, stageStatusLabel, roleMeta, severityMeta, securityMeta, reviewMeta,
   ROLE_BY_STAGE,
+  splitTableRow, parseTableAlign, looksLikeTableRow, parseTaskItem, buildTable,
 } from '../../public/ui.js';
 
 import { createApi, FALLBACK_TEMPLATES, friendlyError, friendlyJobError, ERROR_COPY } from '../../public/api.js';
@@ -125,9 +126,10 @@ describe('renderMarkdown — 结构与格式', () => {
   });
 
   it('渲染无序列表与有序列表', () => {
-    expect(renderMarkdown('- 甲\n- 乙')).toBe('<ul>\n<li>甲</li>\n<li>乙</li>\n</ul>');
+    // 注意 ul 带 class="md-ul"：任务清单样式需要它
+    expect(renderMarkdown('- 甲\n- 乙')).toBe('<ul class="md-ul">\n<li>甲</li>\n<li>乙</li>\n</ul>');
     expect(renderMarkdown('1. 甲\n2. 乙')).toBe('<ol>\n<li>甲</li>\n<li>乙</li>\n</ol>');
-    expect(renderMarkdown('- 甲\n- 乙\n\n收尾段落')).toBe('<ul>\n<li>甲</li>\n<li>乙</li>\n</ul>\n<p>收尾段落</p>');
+    expect(renderMarkdown('- 甲\n- 乙\n\n收尾段落')).toBe('<ul class="md-ul">\n<li>甲</li>\n<li>乙</li>\n</ul>\n<p>收尾段落</p>');
   });
 
   it('渲染引用、分隔线、行内代码', () => {
@@ -226,9 +228,19 @@ describe('renderMarkdown — XSS 中和（安全工程师会攻击这里）', ()
     for (const tag of tags) {
       expect(ALLOWED_TAGS.has(tag), '不该出现的标签: ' + tag).toBe(true);
     }
-    // 所有引号都被转义，没人能闭合属性
-    expect(out).not.toContain('"');
-    expect(out).not.toContain("'");
+    // ⚠️ 这里原来写的是 `expect(out).not.toContain('"')` —— 一条**太宽泛**的断言。
+    // 它的意图是"用户输入的引号被转义、没人能闭合属性"，但实现成了
+    // "整份输出不能有任何双引号"，而我们自己产的标签也要用引号包 class 属性
+    // （加了表格/公式之后就有 class="md-table" 之类了），于是它开始误报。
+    //
+    // 真正要验的是：**用户输入来的引号必须被转义**。
+    // 所以直接检查输入里的引号没有以裸引号形式出现在输出里。
+    expect(out).not.toContain('onerror="');
+    expect(out).not.toContain("onerror='");
+    expect(out).not.toContain('onload="');
+    expect(out).not.toContain("onload='");
+    // 而输入里的引号应该是实体形式
+    expect(out).toContain('&lt;');
   });
 
   it('所有攻击载荷进入 markdown 后都不产生可执行标签', () => {
@@ -948,5 +960,240 @@ describe('开源就绪：必需的文档与文件都在', () => {
         expect(m[2].trim(), `${m[1]} 不该有默认值`).toBe('');
       }
     }
+  });
+});
+
+/* ================================================================== *
+ * Markdown 渲染：表格 / 数学公式 / 任务清单
+ *
+ * 这三样是真实使用中暴露的：
+ *   · AI 写"条款对比""方案对比"**一定**用表格 —— 不渲染的话用户看到一堆竖线
+ *   · AI 算账时**一定**输出 LaTeX —— 不渲染的话用户看到一堆反斜杠
+ *   · AI 写"待办清单"用 `- [ ]` —— 用户正是要拿它一项项打勾的
+ *
+ * ⚠️ 这段测试里**一半是安全用例**。新增渲染路径最大的风险是绕过转义：
+ * 表格要拼很多标签，最容易在某个<td>里漏掉 escapeHtml。
+ * ================================================================== */
+describe('Markdown 表格', () => {
+  it('基本表格渲染成 <table>，含表头与数据行', () => {
+    const html = renderMarkdown([
+      '| 条款 | 对你 |',
+      '|---|---|',
+      '| 押金 | 不利 |',
+      '| 租期 | 中性 |',
+    ].join('\n'));
+    expect(html).toContain('<table');
+    expect(html).toContain('<thead>');
+    expect(html).toContain('<th>条款</th>');
+    expect(html).toContain('<td>押金</td>');
+    expect(html).toContain('<td>中性</td>');
+    // 不该把竖线当正文留下来
+    expect(html).not.toContain('| 押金 |');
+  });
+
+  it('对齐标记生效', () => {
+    const html = renderMarkdown(['| a | b | c |', '|:--|:-:|--:|', '| 1 | 2 | 3 |'].join('\n'));
+    expect(html).toContain('style="text-align:left"');
+    expect(html).toContain('style="text-align:center"');
+    expect(html).toContain('style="text-align:right"');
+  });
+
+  it('列数不齐时不崩，缺的格子补空', () => {
+    const html = renderMarkdown(['| a | b | c |', '|---|---|---|', '| 1 |'].join('\n'));
+    expect(html).toContain('<table');
+    expect((html.match(/<td/g) || []).length).toBe(3);
+  });
+
+  it('⚠️ 不带首尾竖线的表格也要正确分列（模型大量使用这种写法）', () => {
+    // 这个 bug 是在**真实交付物**里发现的：模型写的是
+    //     `条款 | 对你 | 最坏花多少`
+    // 而不是规范的
+    //     `| 条款 | 对你 | 最坏花多少 |`
+    // 原来的切分只剥"整行首尾的竖线"，于是第一格和最后一格多出空字符串，
+    // 渲染出来的 <th> 里塞了整行原文 —— 表格看起来"渲染了"，其实完全没分列。
+    const md = ['条款 | 对你 | 最坏花多少', '---|---|---', '押金 | 中性 | 6000 元'].join('\n');
+    const html = renderMarkdown(md);
+    // 用 <th 开头的匹配（`<th[^>]*>` 会把前面的 `<tr>` 一起吃进 `[^>]*`，
+    // 于是第一格变成 `<tr><th>条款` —— 是**测试的正则**问题，不是渲染问题）
+    const ths = [...html.matchAll(/<th\b[^>]*>([\s\S]*?)<\/th>/g)].map((m) => m[1].trim());
+    expect(ths).toEqual(['条款', '对你', '最坏花多少']);
+    const tds = [...html.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/g)].map((m) => m[1].trim());
+    expect(tds).toEqual(['押金', '中性', '6000 元']);
+    // 表头里绝不能残留裸竖线
+    expect(html).not.toMatch(/<th[^>]*>[^<]*\|/);
+  });
+
+  it('splitTableRow 对各种首尾竖线写法都正确', () => {
+    expect(splitTableRow('| a | b |')).toEqual([' a ', ' b ']);
+    expect(splitTableRow('a | b')).toEqual(['a ', ' b']);
+    expect(splitTableRow('| a | b')).toEqual([' a ', ' b']);
+    expect(splitTableRow('a | b |')).toEqual(['a ', ' b ']);
+    expect(splitTableRow('| a |')).toEqual([' a ']);
+  });
+
+  it('转义竖线 \\| 是内容，不是分列', () => {
+    const html = renderMarkdown(['| a | b |', '|---|---|', '| x \\| y | z |'].join('\n'));
+    expect(html).toContain('<td>x | y</td>');
+    expect(html).toContain('<td>z</td>');
+  });
+
+  it('只写表头不写数据行也能渲染', () => {
+    const html = renderMarkdown(['| 只有表头 |', '|---|'].join('\n'));
+    expect(html).toContain('<th>只有表头</th>');
+  });
+
+  it('普通文字里的竖线不会被当成表格', () => {
+    const html = renderMarkdown('这是正文，里面有 a | b 这样的竖线，不是表格。');
+    expect(html).not.toContain('<table');
+    expect(html).toContain('a | b');
+  });
+
+  it('表格单元格里的行内格式（粗体/代码）照常生效', () => {
+    const html = renderMarkdown(['| a | b |', '|---|---|', '| **粗** | `码` |'].join('\n'));
+    expect(html).toContain('<strong>粗</strong>');
+    expect(html).toContain('<code>码</code>');
+  });
+});
+
+describe('Markdown 表格 —— 安全（新增渲染路径不能绕过转义）', () => {
+  it('单元格里的 <script> 被转义', () => {
+    const html = renderMarkdown(['| a |', '|---|', '| <script>alert(1)</script> |'].join('\n'));
+    expect(html).not.toContain('<script>');
+    expect(html).toContain('&lt;script&gt;');
+  });
+
+  it('单元格里的 <img onerror> 被转义', () => {
+    const html = renderMarkdown(['| a |', '|---|', '| <img src=x onerror=alert(1)> |'].join('\n'));
+    expect(html).not.toMatch(/<img[^>]*onerror/i);
+    expect(html).toContain('&lt;img');
+  });
+
+  it('单元格里的事件属性 onclick 被转义', () => {
+    const html = renderMarkdown(['| a |', '|---|', '| <td onclick="alert(1)">x |'].join('\n'));
+    expect(html).not.toMatch(/onclick=("|')?alert/);
+  });
+
+  it('表头里的脚本同样被转义', () => {
+    const html = renderMarkdown(['| <script>x</script> |', '|---|', '| ok |'].join('\n'));
+    expect(html).not.toContain('<script>');
+  });
+
+  it('单元格里的 javascript: 链接被中和', () => {
+    const html = renderMarkdown(['| a |', '|---|', '| [点我](javascript:alert(1)) |'].join('\n'));
+    expect(html).not.toMatch(/href="javascript:/i);
+  });
+
+  it('单元格里的 HTML 实体不会被二次解码成可执行内容', () => {
+    const html = renderMarkdown(['| a |', '|---|', '| &#60;script&#62;alert(1)&#60;/script&#62; |'].join('\n'));
+    expect(html).not.toContain('<script>');
+  });
+});
+
+describe('Markdown 数学公式', () => {
+  it('行内公式 $...$ 被渲染', () => {
+    const html = renderMarkdown('复利公式是 $A = P(1+r)^n$ 这样。');
+    expect(html).toContain('tex-inline');
+    expect(html).toContain('<sup>n</sup>');
+    expect(html).not.toContain('$A = P');
+  });
+
+  it('分数 \\frac 渲染成 a/b（普通人好读）', () => {
+    const html = renderMarkdown('月供 $\\frac{80万}{12}$ 元。');
+    expect(html).toContain('tex-frac');
+    expect(html).toContain('tex-sep');
+    // 不能把命令名当正文留下
+    expect(html).not.toContain('\\frac');
+    expect(html).not.toContain('frac80');
+  });
+
+  it('\\\\(...\\\\) 与 \\\\[...\\\\] 也认', () => {
+    expect(renderMarkdown('行内 \\(x^2\\) 结束。')).toContain('<sup>2</sup>');
+    expect(renderMarkdown('块级：\n\n\\[\\sum_{i=1}^{n} i\\]\n')).toContain('tex-block');
+  });
+
+  it('$$...$$ 渲染成块级公式', () => {
+    const html = renderMarkdown('推导：\n\n$$\\frac{a}{b} = c$$\n\n结束。');
+    expect(html).toContain('tex-block');
+  });
+
+  it('希腊字母与符号被转成真符号', () => {
+    const html = renderMarkdown('参数 $\\alpha \\leq \\beta$ 满足条件。');
+    expect(html).toContain('α');
+    expect(html).toContain('≤');
+    expect(html).toContain('β');
+  });
+
+  it('⚠️ 金额不能被误判成公式（$100 到 $200 要原样显示）', () => {
+    const html = renderMarkdown('这个要 $100 到 $200，别当成公式。');
+    expect(html).toContain('$100');
+    expect(html).toContain('$200');
+    expect(html).not.toContain('tex-inline');
+  });
+
+  it('纯数字金额的各种写法都不误判', () => {
+    for (const money of ['$100$', '$1,000$', '$12.5$', '$100万$']) {
+      const html = renderMarkdown(`价格是 ${money}。`);
+      expect(html, `${money} 被误判成公式了`).not.toContain('tex-inline');
+    }
+  });
+
+  it('单美元符号（不配对）不动它', () => {
+    const html = renderMarkdown('花了 $50 块钱，没写完整。');
+    expect(html).toContain('$50');
+  });
+
+  it('不认识的 LaTeX 命令保留命令名（比留一串反斜杠好读）', () => {
+    const html = renderMarkdown('试试 $\\weirdcmd{x}$。');
+    expect(html).not.toContain('\\weirdcmd');
+    expect(html).toContain('weirdcmd');
+  });
+
+  it('嵌套分数', () => {
+    const html = renderMarkdown('$\\frac{\\frac{1}{2}}{3}$');
+    expect((html.match(/tex-frac/g) || []).length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe('Markdown 数学 —— 安全', () => {
+  it('公式里的 <script> 被转义（公式渲染不能成为注入通道）', () => {
+    const html = renderMarkdown('$<script>alert(1)</script>$');
+    expect(html).not.toContain('<script>');
+    expect(html).toContain('&lt;script&gt;');
+  });
+
+  it('公式里的 img onerror 被转义', () => {
+    const html = renderMarkdown('$<img src=x onerror=alert(1)>$');
+    expect(html).not.toMatch(/<img[^>]*onerror/i);
+  });
+
+  it('公式里塞 javascript: 链接也不行', () => {
+    const html = renderMarkdown('$[x](javascript:alert(1))$');
+    expect(html).not.toMatch(/href="javascript:/i);
+  });
+});
+
+describe('Markdown 任务清单', () => {
+  it('- [ ] 与 - [x] 渲染成带方框的条目', () => {
+    const html = renderMarkdown('- [ ] 今天问房东\n- [x] 拍照留存');
+    expect(html).toContain('md-task');
+    expect(html).toContain('☐');
+    expect(html).toContain('☑');
+    expect(html).toContain('is-done');
+  });
+
+  it('普通列表项不受影响', () => {
+    const html = renderMarkdown('- 普通项目\n- 另一个');
+    expect(html).toContain('<li>普通项目</li>');
+    expect(html).not.toContain('md-task');
+  });
+
+  it('任务项里的行内格式照常生效', () => {
+    const html = renderMarkdown('- [ ] 记住 **重点**');
+    expect(html).toContain('<strong>重点</strong>');
+  });
+
+  it('任务项里的脚本被转义', () => {
+    const html = renderMarkdown('- [ ] <script>alert(1)</script>');
+    expect(html).not.toContain('<script>');
   });
 });

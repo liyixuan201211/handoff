@@ -200,6 +200,17 @@ function artifactMeta(a) {
  *   不是二进制大文件，一次几万字完全在合理范围内。）
  */
 function artifactFull(a) {
+  // ⚠️ 版本字段必须带上，否则界面显示不出"第 2 版"徽章和"看历史版本"按钮。
+  //
+  // 但这里**只给版本元信息，不给历史正文**。理由：
+  // 一份 4000 字 × 5 版 = 2 万字。每次刷新详情都传 2 万字，
+  // 而 99% 的时候用户只看最新版（就是上面的 content）。
+  // 想看历史的人点"看历史版本"，那时才去 /versions 端点取正文。
+  //
+  // 实测踩到过：投影函数漏了这两个字段，磁盘上有 version=1/versions=1，
+  // 接口返回的却是 version=null/versions=[] —— 界面什么都不显示，
+  // 而"数据明明在"会让人以为是前端的问题。
+  const versions = Array.isArray(a.versions) ? a.versions : [];
   return {
     id: a.id,
     deliverableId: a.deliverableId ?? null,
@@ -210,6 +221,18 @@ function artifactFull(a) {
     confidence: a.confidence ?? null,
     basedOn: Array.isArray(a.basedOn) ? a.basedOn : [],
     createdAt: a.createdAt ?? null,
+    // 当前是第几版
+    version: a.version ?? (versions.length || 1),
+    // 版本数（界面用它判断要不要显示"看历史版本"按钮）
+    versionCount: versions.length || 1,
+    // 每版的元信息（不含正文）—— 界面可以直接列出"第1版/第2版"的摘要
+    versionMeta: versions.map((v) => ({
+      n: v.n,
+      round: v.round ?? 1,
+      stageKey: v.stageKey ?? null,
+      at: v.at ?? null,
+      chars: v.chars ?? 0,
+    })),
   };
 }
 

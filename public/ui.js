@@ -1,3 +1,4 @@
+import { extractMath } from './math.js';
 /**
  * Handoff — UI 纯函数层（[S5] 前端工程师）
  *
@@ -139,6 +140,123 @@ function unescapeBasic(s) {
  * @param {unknown} src
  * @returns {string} 可安全交给 innerHTML 的字符串
  */
+/**
+ * 表格：判断一行是不是分隔行（`|---|---|` 或 `| :--- | ---: |`）并取出对齐方式。
+ *
+ * ⚠️ 分隔行必须满足"只有 | - : 空格"这几种字符。
+ * 否则 `| 押金 | 6000 |` 这种普通数据行会被误判成分隔行，表格结构就乱了。
+ * @returns {string[]|null} 对齐数组（'left'|'center'|'right'|''），不是分隔行返回 null
+ */
+export function parseTableAlign(sepLine) {
+  const raw = String(sepLine ?? '').trim();
+  if (!raw.includes('-')) return null;
+  if (!/^\|?[\s:|-]+\|?$/.test(raw)) return null;
+  const cells = splitTableRow(raw);
+  if (!cells.length) return null;
+  const out = [];
+  for (const c of cells) {
+    const t = c.trim();
+    if (!/^:?-{1,}:?$/.test(t)) return null; // 每一格都必须是 --- 或 :--: 之类
+    const left = t.startsWith(':');
+    const right = t.endsWith(':');
+    out.push(left && right ? 'center' : right ? 'right' : left ? 'left' : '');
+  }
+  return out;
+}
+
+/**
+ * 切一行表格。要处理 `\|`（转义竖线）—— 内容里出现竖线是常见的
+ * （比如 `a \| b`），不能把它当成列分隔。
+ */
+export function splitTableRow(line) {
+  const raw = String(line ?? '').trim();
+
+  const cells = [];
+  let cur = '';
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i];
+    if (ch === '\\' && raw[i + 1] === '|') {
+      cur += '|'; // 转义的竖线是内容，不是分列
+      i += 1;
+      continue;
+    }
+    if (ch === '|') {
+      cells.push(cur);
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  cells.push(cur);
+
+  // ⚠️ 首尾的竖线是"边框"，不是空列。
+  //
+  // 这里踩过一个会让**表头整个塌成一列**的 bug：
+  //   原实现只处理"整行以 | 开头/结尾"的情况（Markdown 规范写法 `| a | b |`），
+  //   但模型（和真实看到的那份交付物）大量使用**不带首尾竖线**的写法：
+  //       `条款 | 对你 | 最坏花多少`
+  //   于是第一格和最后一格各多出一个空字符串，
+  //   渲染出来的 `<th>` 里塞了整行原文（`<th>条款 | 对你 | 最坏花多少`），
+  //   表格看起来"渲染了"，其实完全没分列 —— 比不渲染还糟。
+  //   修法：按"有没有被竖线围起来"来剥，而不是只看整行首尾。
+  if (cells.length > 1 && cells[0].trim() === '') cells.shift();
+  if (cells.length > 1 && cells[cells.length - 1].trim() === '') cells.pop();
+  return cells;
+}
+
+/** 一行看起来像表格行吗（至少有一个未转义的 |） */
+export function looksLikeTableRow(line) {
+  const s = String(line ?? '').trim();
+  if (!s.includes('|')) return false;
+  return /(^|[^\\])\|/.test(s);
+}
+
+/** 任务清单：`- [ ] 待办` / `- [x] 已完成` */
+export function parseTaskItem(text) {
+  const m = String(text ?? '').match(/^\s*\[[\s xX✓]\]\s+(.*)$/);
+  if (!m) return null;
+  return { done: /[xX✓]/.test(String(text).match(/^\s*\[([\s xX✓])\]/)[1]), text: m[1] };
+}
+
+/**
+ * 拼一张表格。
+ *
+ * ⚠️ 安全：每个单元格的文本都经过 renderText（内部先 escapeHtml），
+ * 我们只是把**已经安全**的片段放进 `<td>`。绝不能在这里直接拼原始文本 ——
+ * 模型输出是不可信内容，表格是最容易漏掉转义的地方（因为要拼很多标签）。
+ *
+ * @param {string[]} header 表头单元格（原始文本）
+ * @param {string[][]} rows 数据行
+ * @param {string[]} align 每列对齐
+ * @param {(raw:string)=>string} renderText 行内渲染函数（已含转义）
+ */
+export function buildTable(header, rows, align, renderText) {
+  const cols = Math.max(header.length, ...rows.map((r) => r.length), align.length);
+  const alignAttr = (i) => (align[i] ? ` style="text-align:${align[i]}"` : '');
+
+  const parts = ['<div class="md-table-wrap"><table class="md-table">'];
+  if (header.length) {
+    parts.push('<thead><tr>');
+    for (let i = 0; i < cols; i += 1) {
+      const cell = header[i] ?? '';
+      parts.push(`<th${alignAttr(i)}>${renderText(cell.trim())}</th>`);
+    }
+    parts.push('</tr></thead>');
+  }
+  parts.push('<tbody>');
+  for (const row of rows) {
+    // 全空行跳过（模型偶尔会多留一个空行）
+    if (row.every((c) => !String(c ?? '').trim())) continue;
+    parts.push('<tr>');
+    for (let i = 0; i < cols; i += 1) {
+      parts.push(`<td${alignAttr(i)}>${renderText(String(row[i] ?? '').trim())}</td>`);
+    }
+    parts.push('</tr>');
+  }
+  parts.push('</tbody></table></div>');
+  return parts.join('');
+}
+
 export function renderMarkdown(src) {
   if (src === null || src === undefined) return '';
   const text = stripControlChars(String(src)).replace(/\uE000/g, '').replace(/\r\n?/g, '\n');
@@ -181,7 +299,15 @@ export function renderMarkdown(src) {
   let listType = null;   // 'ul' | 'ol'
   let quote = [];
 
-  const renderText = (raw) => inline(escapeHtml(extract(raw)), tables);
+  // 渲染一段行内文本。顺序很重要：
+  //   extract(代码) → escapeHtml(整个文本) → extractMath(数学) → inline(粗斜体/链接)
+  // 数学必须在 escapeHtml **之后**做：它要插 `<sup>` 这类标签，
+  // 如果放在转义之前，我们插的标签会被转义掉。
+  const renderText = (raw) => {
+    const escaped = escapeHtml(extract(raw));
+    const withMath = extractMath(escaped, tables, MARKER);
+    return inline(withMath, tables);
+  };
   const flushPara = () => {
     if (!para.length) return;
     out.push('<p>' + para.map(renderText).join('<br>') + '</p>');
@@ -197,13 +323,48 @@ export function renderMarkdown(src) {
   };
   const flushAll = () => { flushPara(); flushList(); flushQuote(); };
 
-  for (const raw of stage) {
+  // 用索引循环：表格要向前看（下一行是不是分隔行），要一次吃多行
+  for (let idx = 0; idx < stage.length; idx += 1) {
+    const raw = stage[idx];
     const line = raw.replace(/\s+$/, '');
 
-    // 代码块占位符：单独成段
-    if (/^\uE000b\d+\uE000$/.test(line)) { flushAll(); out.push(line); continue; }
+    // 代码块 / 块级公式占位符：单独成段时用块级样式
+    if (/^\uE000b\d+\uE000$/.test(line)) {
+      flushAll();
+      const ph = line;
+      const m = line.match(/^\uE000b(\d+)\uE000$/);
+      const html = tables.blocks[Number(m[1])];
+      // 块级公式在独立成段时升级成 div（更好看、可横向滚动）；
+      // 出现在表格单元格里时不会被走到这里（单元格走 renderText）。
+      out.push(typeof html === 'string' && html.startsWith('<span class="tex-block">')
+        ? html.replace('<span class="tex-block">', '<div class="tex-block">').replace(/<\/span>$/, '</div>')
+        : ph);
+      continue;
+    }
 
     if (!line.trim()) { flushAll(); continue; }
+
+    // ── 表格 ────────────────────────────────────────────────────
+    // 必须在"分隔线"之前判断：`|---|---|` 里的 `---` 也长得像分隔线。
+    if (looksLikeTableRow(line)) {
+      const next = stage[idx + 1];
+      const align = next !== undefined ? parseTableAlign(next) : null;
+      if (align) {
+        flushAll();
+        const header = splitTableRow(line);
+        const rows = [];
+        idx += 2; // 跳过表头和分隔行
+        while (idx < stage.length && looksLikeTableRow(stage[idx])) {
+          // 下一行也可能是分隔行（极少见），跳过它
+          if (parseTableAlign(stage[idx])) { idx += 1; continue; }
+          rows.push(splitTableRow(stage[idx]));
+          idx += 1;
+        }
+        out.push(buildTable(header, rows, align, renderText));
+        idx -= 1; // for 循环会再 +1
+        continue;
+      }
+    }
 
     // 分隔线
     if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flushAll(); out.push('<hr>'); continue; }
@@ -230,12 +391,23 @@ export function renderMarkdown(src) {
       continue;
     }
 
-    // 无序列表
+    // 无序列表（含任务清单 `- [ ]` / `- [x]`）
     const ul = line.match(/^\s*[-*+]\s+(.*)$/);
     if (ul) {
       flushPara(); flushQuote();
-      if (listType !== 'ul') { flushList(); out.push('<ul>'); listType = 'ul'; }
-      out.push('<li>' + renderText(ul[1]) + '</li>');
+      if (listType !== 'ul') { flushList(); out.push('<ul class="md-ul">'); listType = 'ul'; }
+      const task = parseTaskItem(ul[1]);
+      if (task) {
+        // 任务清单渲染成带方框的条目 —— AI 写"待办清单"时常用这个语法，
+        // 而用户正是要拿它一项项去打勾的。
+        out.push(
+          '<li class="md-task' + (task.done ? ' is-done' : '') + '">' +
+          '<span class="md-checkbox" aria-hidden="true">' + (task.done ? '☑' : '☐') + '</span> ' +
+          renderText(task.text) + '</li>',
+        );
+      } else {
+        out.push('<li>' + renderText(ul[1]) + '</li>');
+      }
       continue;
     }
 

@@ -1399,7 +1399,11 @@ class JobView {
       const hasBody = typeof body0 === 'string';
 
       const box = el('article', { class: 'artifact', 'data-artifact-id': String(art.id || '') });
-      const versionCount = Array.isArray(art.versions) ? art.versions.length : 0;
+      // 详情接口给的是 versionCount（元信息）；旧数据可能只有 versions 数组。
+      // 两个都兼容 —— 前端不该因为后端少给一个字段就什么都不显示。
+      const versionCount = Number.isFinite(art.versionCount)
+        ? art.versionCount
+        : (Array.isArray(art.versions) ? art.versions.length : 1);
       const head = el('header', { class: 'artifact-head' }, [
         el('span', { class: 'artifact-title-wrap' }, [
           text('h3', 'artifact-name', art.name || '未命名成果'),

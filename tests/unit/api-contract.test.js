@@ -178,6 +178,60 @@ describe('接线：前端 api.js ↔ 后端 HTTP（这是唯一能发现"解包"
     expect(typeof res.fallback).toBe('boolean');
   });
 
+  it('详情接口的交付物必须带版本信息（否则界面显示不出"第 N 版"）', async () => {
+    // ⚠️ 这条守的是一个"数据明明在、接口却不给"的 bug：
+    // 磁盘上 artifact.version=1、versions 有 1 条，但投影函数漏了这两个字段，
+    // 于是接口返回 version=null / versions=[]，界面什么都不显示。
+    // 这类 bug 很难查，因为"后端看起来是对的"（数据确实存了）。
+    const created = await api.createJob({ goal: '接线测试：版本字段', demo: true });
+    let job = created;
+    for (let i = 0; i < 200; i += 1) {
+      await new Promise((r) => setTimeout(r, 100));
+      job = await api.getJob(created.id);
+      if (job.status !== 'running' && job.status !== 'queued') break;
+    }
+    expect(job.artifacts.length).toBeGreaterThan(0);
+    for (const a of job.artifacts) {
+      expect(typeof a.version, `${a.name} 缺少 version`).toBe('number');
+      expect(a.version).toBeGreaterThanOrEqual(1);
+      expect(typeof a.versionCount, `${a.name} 缺少 versionCount`).toBe('number');
+      expect(a.versionCount).toBeGreaterThanOrEqual(1);
+      expect(Array.isArray(a.versionMeta), `${a.name} 缺少 versionMeta`).toBe(true);
+      expect(a.versionMeta.length).toBe(a.versionCount);
+      // 元信息里**不该**带正文（详情响应要小）
+      if (a.versionMeta[0]) {
+        expect(a.versionMeta[0].content).toBeUndefined();
+        expect(typeof a.versionMeta[0].n).toBe('number');
+      }
+    }
+  }, 40_000);
+
+  it('版本查询接口能拿到每一版的完整正文', async () => {
+    const created = await api.createJob({ goal: '接线测试：版本正文', demo: true });
+    let job = created;
+    for (let i = 0; i < 200; i += 1) {
+      await new Promise((r) => setTimeout(r, 100));
+      job = await api.getJob(created.id);
+      if (job.status !== 'running' && job.status !== 'queued') break;
+    }
+    const data = await api.getVersions(created.id);
+    expect(Array.isArray(data.artifacts)).toBe(true);
+    expect(data.artifacts.length).toBeGreaterThan(0);
+    for (const a of data.artifacts) {
+      expect(a.versions.length).toBeGreaterThanOrEqual(1);
+      for (const v of a.versions) {
+        // 正文要在 —— 用户查版本时不该再跑一次模型
+        expect(typeof v.content).toBe('string');
+        expect(v.content.length).toBeGreaterThan(0);
+        expect(typeof v.n).toBe('number');
+        expect(typeof v.round).toBe('number');
+      }
+    }
+    // 轨迹字段也要在（即使为空数组）
+    expect(Array.isArray(data.toolTrace)).toBe(true);
+    expect(Array.isArray(data.roundHistory)).toBe(true);
+  }, 40_000);
+
   it('错误响应：{ error: { code, message } } 的形状必须被 api.js 正确识别', async () => {
     await expect(api.getJob('job_0000000000000000')).rejects.toMatchObject({
       code: expect.any(String),
